@@ -472,6 +472,84 @@ fn ps_and_stop_manage_detached_processes() {
 
 #[test]
 #[cfg(unix)]
+fn stop_kills_the_whole_process_group_not_just_the_leader() {
+    // Regression for `deemo stop` leaving the real server alive: a launcher
+    // like dshx spawns the actual workload as a child (here: a shell with two
+    // background sleeps standing in for pnpm -> node -> bound port). Killing
+    // only the registered pid would orphan the rest; the stop must take down
+    // the whole group deemo's setsid created.
+    let home = tempfile::tempdir().unwrap();
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args([
+            "--label",
+            "tree",
+            "--",
+            "sh",
+            "-c",
+            "sleep 61.731 & sleep 62.731 & wait",
+        ])
+        .assert()
+        .success();
+    std::thread::sleep(std::time::Duration::from_millis(300)); // let the shell fork
+
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["stop", "tree"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("stopped"));
+
+    // No member of the tree may survive (pgrep prints nothing once all gone).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let out = StdCommand::new("pgrep")
+            .args(["-f", "sleep 6[12]\\.73[1]"])
+            .output()
+            .unwrap();
+        if out.stdout.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "group members survived deemo stop: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // ... and the pid file is gone with them.
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["ps"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("no processes"));
+}
+
+#[test]
+#[cfg(unix)]
+fn stop_sweeps_dead_registrations_instead_of_keeping_them() {
+    // A stale pid file (crashed child, or a pre-0.1.1 leftover) must be
+    // removed by `stop` too, not just by `ps`.
+    let home = tempfile::tempdir().unwrap();
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["--label", "gone", "--", "sh", "-c", "exit 0"])
+        .assert()
+        .success();
+    std::thread::sleep(std::time::Duration::from_millis(300)); // child exits
+
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["stop", "gone"])
+        .assert()
+        .code(1); // label no longer exists -> "no process with label"
+    assert!(home.path().join("run").read_dir().unwrap().next().is_none());
+}
+
+#[test]
+#[cfg(unix)]
 fn detach_command_not_found_is_127() {
     let home = tempfile::tempdir().unwrap();
     deemo()

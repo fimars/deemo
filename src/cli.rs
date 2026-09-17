@@ -14,7 +14,8 @@ pub enum Timestamp {
 pub enum Manage {
     /// List processes started by deemo (detached ones may still be running).
     Ps,
-    /// Stop detached process(es) by label (sends SIGTERM on unix).
+    /// Stop detached process(es) by label: SIGTERM to the whole process
+    /// group on unix (SIGKILL after a grace period).
     Stop {
         /// Label(s) of the detached process(es) to stop.
         #[arg(value_name = "LABEL", required = true)]

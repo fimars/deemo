@@ -1,5 +1,13 @@
 //! Process registry for detached runs: a small pid-file store under
 //! `$DEEMO_HOME/run/` plus listing, liveness probing and stopping.
+//!
+//! Stopping kills the whole **process group**, not a single pid: deemo's
+//! detach puts the child in its own session (setsid), so the registered pid
+//! is the session and group leader and every descendant that did not
+//! daemonize itself away lives in that group. A plain `kill(pid)` would only
+//! take down the leader and orphan the rest (launcher -> real server trees
+//! like `dshx` -> `pnpm dsh web`), which is exactly what pid 1 adoption and
+//! a still-bound port look like afterwards.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -107,10 +115,27 @@ pub fn list(home: &Path) -> Vec<(Entry, bool)> {
     entries
 }
 
+/// How a stop attempt ended.
+enum StopOutcome {
+    /// SIGTERM alone took the group down.
+    Terminated,
+    /// SIGTERM was ignored; SIGKILL took the group down.
+    Killed,
+    /// Still alive after SIGKILL (or unsignalable): give up honestly.
+    Stubborn,
+}
+
+const TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Stop all processes with the given label(s). Returns an exit code.
 pub fn stop(home: &Path, labels: &[String]) -> i32 {
+    // Dead registrations must not linger (nor show up as "is not running"):
+    // sweep them before matching, like `ps` does.
+    sweep_dead(home);
     let all = list(home);
     let mut missing = Vec::new();
+    let mut stubborn = false;
     for label in labels {
         let mut hits = 0usize;
         for (entry, alive) in &all {
@@ -119,11 +144,24 @@ pub fn stop(home: &Path, labels: &[String]) -> i32 {
             }
             hits += 1;
             if *alive {
-                kill(entry.pid);
-                eprintln!(
-                    "deemo: stopped {} (pid {}, SIGTERM)",
-                    entry.label, entry.pid
-                );
+                match terminate(entry.pid) {
+                    StopOutcome::Terminated => eprintln!(
+                        "deemo: stopped {} (pid {}, SIGTERM to process group)",
+                        entry.label, entry.pid
+                    ),
+                    StopOutcome::Killed => eprintln!(
+                        "deemo: stopped {} (pid {}, SIGKILL after grace period)",
+                        entry.label, entry.pid
+                    ),
+                    StopOutcome::Stubborn => {
+                        stubborn = true;
+                        eprintln!(
+                            "deemo: {} (pid {}) survived SIGTERM and SIGKILL; keeping its pid file",
+                            entry.label, entry.pid
+                        );
+                        continue; // keep the registration so the user can retry
+                    }
+                }
             } else {
                 eprintln!("deemo: {} (pid {}) is not running", entry.label, entry.pid);
             }
@@ -136,24 +174,62 @@ pub fn stop(home: &Path, labels: &[String]) -> i32 {
     for label in &missing {
         eprintln!("deemo: no process with label '{label}'");
     }
-    if missing.is_empty() {
-        0
-    } else {
-        1
-    }
+    i32::from(stubborn || !missing.is_empty())
 }
 
 #[cfg(unix)]
-fn kill(pid: u32) {
-    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+fn group_gone(pgid: i32) -> bool {
+    // kill(pgid, 0) succeeds while ANY member of the group exists, so this is
+    // the all-clear test for the whole tree (the leader alone can die first).
+    unsafe { libc::killpg(pgid, 0) != 0 }
+}
+
+#[cfg(unix)]
+fn wait_group_gone(pgid: i32, grace: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if group_gone(pgid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    group_gone(pgid)
+}
+
+/// SIGTERM the detached child's whole process group; escalate to SIGKILL when
+/// the grace period passes. Returns whether the group is gone afterwards.
+#[cfg(unix)]
+fn terminate(pid: u32) -> StopOutcome {
+    // The registered pid is the group leader (detach does setsid), so
+    // killpg(pgid=pid) reaches every descendant in one blow.
+    let pgid = pid as i32;
+    unsafe {
+        if libc::killpg(pgid, libc::SIGTERM) != 0 && !group_gone(pgid) {
+            // e.g. EPERM; nothing more we can do
+            return StopOutcome::Stubborn;
+        }
+    }
+    if wait_group_gone(pgid, TERM_GRACE) {
+        return StopOutcome::Terminated;
+    }
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    if wait_group_gone(pgid, KILL_GRACE) {
+        StopOutcome::Killed
+    } else {
+        StopOutcome::Stubborn
+    }
 }
 
 #[cfg(not(unix))]
-fn kill(pid: u32) {
-    // No std-only signal API on Windows; taskkill /F is the pragmatic route.
+fn terminate(pid: u32) -> StopOutcome {
+    // No std-only signal API on Windows; taskkill /F /T (tree) is the
+    // pragmatic route. Liveness is unknowable here, so report success.
     let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/PID", &pid.to_string()])
+        .args(["/F", "/T", "/PID", &pid.to_string()])
         .status();
+    StopOutcome::Terminated
 }
 
 /// Remove pid-files whose processes are no longer alive (housekeeping for ps).

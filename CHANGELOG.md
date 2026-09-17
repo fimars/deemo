@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-09-17
+
+### Fixed
+
+- **`deemo stop` now kills the whole process group, not just the registered
+  pid.** Launchers that spawn the real server as a child (e.g. `dshx` →
+  `pnpm dsh web`) used to leave the server orphaned and still bound to its
+  port: SIGTERM took down only the launcher, and the pid file was removed
+  immediately, so the surviving tree became unmanageable. Since detach mode
+  starts the child in its own session (`setsid`), the registered pid is the
+  group leader — `killpg` now reaches every descendant in one blow.
+- `deemo stop` verifies the tree actually died: bounded SIGTERM grace (5 s),
+  then SIGKILL escalation (1 s), and only then is the pid file removed. A
+  process that survives both is reported honestly (exit code 1, registration
+  kept for retry).
+- `deemo stop` also sweeps dead registrations up front (previously only
+  `deemo ps` did), so stale pid files no longer linger as "is not running".
+- Windows: `taskkill /F /T` (tree kill) instead of `/F` only.
+
 ## [0.1.0] - 2026-09-16
 
 ### Added

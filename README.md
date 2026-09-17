@@ -48,9 +48,20 @@ cargo install --path .
 
 ```bash
 deemo ps                 # list started processes (label, pid, alive, log)
-deemo stop <LABEL>       # SIGTERM detached process(es) by label
+deemo stop <LABEL>       # SIGTERM to the whole process group (SIGKILL after a
+                         # grace period) — launcher + real server + all
+                         # descendants die together; pid file removed only
+                         # once the tree is confirmed gone
 deemo logs <LABEL>       # newest log file of a label: path + last ~4 KiB
 ```
+
+`stop` targets the **process group**, not a single pid: detach mode puts the
+child in its own session (`setsid`), so the registered pid is the group
+leader and every descendant that did not daemonize itself away is stopped
+with it. Launchers that spawn the actual workload (deno/npm/pnpm wrappers)
+are therefore stopped completely. A command that deliberately double-forks
+into its own session escapes any process-group supervisor — deemo included —
+and is the author's responsibility.
 
 ### Foreground — `deemo --foreground -- <CMD>`
 
@@ -139,7 +150,7 @@ DEEMO_HOME=/var/log/deemo deemo -- ./my-server
   launcher — the daemon does not receive it. To stop it: `deemo stop <label>`.
 - Merged stdout/stderr line ordering is non-deterministic (same as shell
   `2>&1`).
-- On Windows, `deemo stop` uses `taskkill /F` (hard stop); liveness in
+- On Windows, `deemo stop` uses `taskkill /F /T` (hard tree stop); liveness in
   `deemo ps` is unix-precise, best-effort elsewhere.
 - Names collide between management commands and child programs? Always invoke
   children with `--`: `deemo -- ps -ef` runs `ps`, while `deemo ps` lists
@@ -148,7 +159,7 @@ DEEMO_HOME=/var/log/deemo deemo -- ./my-server
 ## Development
 
 ```bash
-cargo test                     # 21 integration tests (process lifecycle, signals, IO)
+cargo test                     # 25 integration tests (process lifecycle, signals, IO)
 scripts/e2e-tmux.sh            # end-to-end smoke through a real tmux terminal:
                                # daemonize `python3 -m http.server`, verify HTTP
                                # 200, `ps`, stderr capture in `logs`, `stop`,
