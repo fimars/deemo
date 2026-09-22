@@ -10,7 +10,9 @@ use std::process::Stdio;
 
 use predicates::prelude::*;
 use std::process::Command as StdCommand;
-use support::{wait_for_log, Home};
+#[cfg(unix)] // only the `--background` tests need it
+use support::wait_for_log;
+use support::Home;
 
 /// README: "capture a pipeline" — passthrough is byte-exact and logged, and
 /// the mode announces itself so a waiting pipe never looks like a hang.

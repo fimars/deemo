@@ -5,8 +5,11 @@
 
 mod support;
 
+#[cfg(unix)]
 use predicates::prelude::*;
+#[cfg(unix)]
 use std::process::Command as StdCommand;
+#[cfg(unix)]
 use support::{bind_quiet, free_port, poll_until, Home};
 
 /// README: `--dry-run` "prints the pids that would be killed, one per line".
@@ -94,17 +97,6 @@ fn kill_without_a_port_is_a_usage_error() {
 #[cfg(unix)]
 fn have_python3() -> bool {
     StdCommand::new("python3").arg("--version").output().is_ok()
-}
-
-/// The pid deemo reports for a detach: `deemo: detached [...] (pid N)` is
-/// the registered child — the same pid `kill --dry-run` must list.
-#[cfg(unix)]
-fn detached_child_pid(err: &str) -> u32 {
-    err.split("(pid ")
-        .nth(1)
-        .and_then(|s| s.split(')').next())
-        .and_then(|s| s.parse().ok())
-        .expect("detach must report the child pid")
 }
 
 /// README: kill frees the port AND housekeeping keeps `ps` truthful — a
@@ -201,7 +193,10 @@ fn kill_mixed_ports_stills_kill_and_reports_the_free_one() {
 /// DESIGN: "Only sockets whose **local** address is that port are targets …
 /// A client connected *to* the port has some other local port and is left
 /// alone." Live proof: discovery sees both sides of the connection, deemo
-/// keeps the binder. Skipped without python3.
+/// keeps the binder. The binder is this test's own listener — it is
+/// listening before the client spawns, so nothing about a third-party
+/// server's startup (or the runner's DNS) can race the connect. Skipped
+/// without python3.
 #[cfg(unix)]
 #[test]
 fn kill_targets_binders_not_clients_connected_to_the_port() {
@@ -210,34 +205,8 @@ fn kill_targets_binders_not_clients_connected_to_the_port() {
         return;
     }
     let home = Home::new();
-    let port = free_port();
-    let out = home
-        .bin()
-        .args([
-            "--label",
-            "binder",
-            "--",
-            "python3",
-            "-m",
-            "http.server",
-            &port.to_string(),
-            "--bind",
-            "127.0.0.1",
-        ])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let server_pid = detached_child_pid(&String::from_utf8_lossy(&out.stderr));
-
-    poll_until("http.server to bind the port", || {
-        let found = home
-            .deemo()
-            .args(["kill", &port.to_string(), "--dry-run"])
-            .output()
-            .unwrap();
-        !found.stdout.is_empty()
-    });
+    let listener = bind_quiet();
+    let port = listener.local_addr().unwrap().port();
 
     // A client connects TO the port (local side ephemeral) and reports back
     // through a marker file — no reliance on lsof being installed.
@@ -269,15 +238,15 @@ fn kill_targets_binders_not_clients_connected_to_the_port() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let listed: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    let binder = std::process::id().to_string();
     assert_eq!(
         listed,
-        vec![server_pid.to_string().as_str()],
+        vec![binder.as_str()],
         "only the binder is a target, never the client (pid {})",
         client.id()
     );
 
-    // Cleanup: server through deemo's group stop, client killed directly.
-    home.deemo().args(["stop", "binder"]).assert().success();
+    // Cleanup: the client is our child, the listener drops with this scope.
     let _ = client.kill();
     let _ = client.wait();
 }
