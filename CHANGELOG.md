@@ -19,6 +19,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `scripts/e2e-server.py` (bind, listen, same stderr request log), the
   binder test listens from the test process itself, and e2e failures dump
   the captured logs.
+- Three more races inside the suite itself: `job_detach`'s session test read
+  the log before the child had written its second line; `kill --dry-run`
+  demanded an *exact* pid list while a sibling test's mid-spawn child still
+  carried an inherited copy of the listener fd — the kernel reports that
+  holder truthfully (as `lsof`/`fuser` would); and the same test dropped its
+  listener into the pool every `bind_quiet` scan starts from, so a late
+  sibling could re-grab the port before the "reads as free" check. The
+  assertions now pin the contract instead: the binder listed exactly once, a
+  released port read as free (exit 1), and a client connected to the port
+  never listed — with the free-check's ports drawn from a pool no other test
+  scans.
 
 ## [0.2.0] - 2026-09-22
 
