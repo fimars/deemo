@@ -154,7 +154,7 @@ fn pids_from_netstat(text: &str, port: u16) -> Vec<u32> {
 /// Socket inodes in one `/proc/net/*` table bound locally to `port`.
 /// Line 0 is the header; `local_address` (field 1) is
 /// `<hex addr>:<hex port>`, the inode is field 9.
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 fn socket_inodes(table: &str, port: u16) -> Vec<String> {
     table
         .lines()
@@ -249,15 +249,20 @@ Active Connections\n\
         assert!(pids_from_netstat(out, 9000).is_empty());
     }
 
-    #[cfg(target_os = "linux")]
+    // Not gated to linux: the parser is pure string handling, and running it
+    // on every platform is what keeps a fixture bug from hiding behind a cfg.
     #[test]
     fn procfs_tables_are_matched_on_the_hex_local_port() {
-        // 0x1F90 = 8000, 0x0016 = 22
+        // 0x1F40 = 8000, 0x0016 = 22, 0xC001 = 49153 (row 1's peer port)
         let table = "\
   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
-   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 123456\n\
+   0: 0100007F:1F40 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 123456\n\
    1: 0100007F:0016 0100007F:C001 01 00000000:00000000 00:00000000 00000000     0        0 654321\n";
         assert_eq!(socket_inodes(table, 8000), vec!["123456".to_string()]);
         assert!(socket_inodes(table, 8001).is_empty());
+        // only the local side counts: row 1 binds 22 locally …
+        assert_eq!(socket_inodes(table, 22), vec!["654321".to_string()]);
+        // … while its peer port 49153 belongs to the other end of nothing here
+        assert!(socket_inodes(table, 0xC001).is_empty());
     }
 }
