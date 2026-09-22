@@ -7,9 +7,12 @@
 # (T10). Everything else is a smoke duplicate of tests/*.rs, whose black-box
 # tests (`cargo test`) are the source of truth for behaviour.
 #
-# The benchmark workload is `python3 -m http.server`: a persistent process
-# whose request log goes to *stderr*, so it also proves deemo captures both
-# fds without `2>&1`.
+# The benchmark workload is scripts/e2e-server.py: a persistent python
+# server whose request log goes to *stderr*, so it also proves deemo captures
+# both fds without `2>&1`. Deliberately not `python3 -m http.server`: its
+# HTTPServer.server_bind calls socket.getfqdn() (reverse DNS) between bind()
+# and listen(), and that lookup can stall for a minute on CI runners — the
+# test would then measure the runner's DNS instead of deemo.
 #
 # Usage: scripts/e2e-tmux.sh [path-to-binary]
 #   (default: target/release/deemo)
@@ -23,10 +26,23 @@ HOMEDIR=$(mktemp -d)
 export DEEMO_HOME=$HOMEDIR
 echo "hello e2e" > "$DOCROOT/index.html"
 
-fail() { echo "FAIL: $*" >&2; echo "--- pane tail:"; tmux -S "$SOCKET" capture-pane -p -J -t "$SESSION":0.0 -S -30 2>/dev/null | tail -20; cleanup; exit 1; }
+# On any failure: the pane, then whatever deemo captured — a test that
+# cannot say what it saw wastes the next run.
+dump_logs() {
+  [ -d "$HOMEDIR/logs" ] || return 0
+  echo "--- captured logs:"
+  for f in "$HOMEDIR"/logs/*; do
+    [ -f "$f" ] || continue
+    echo "== $f"
+    tail -20 "$f"
+  done
+}
+fail() { echo "FAIL: $*" >&2; echo "--- pane tail:"; tmux -S "$SOCKET" capture-pane -p -J -t "$SESSION":0.0 -S -30 2>/dev/null | tail -20; dump_logs; cleanup; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || fail "e2e needs '$1'"; }
 need tmux; need python3; need curl
 [ -x "$BIN" ] || fail "binary not found: $BIN (run cargo build --release)"
+SERVER="$(cd "$(dirname "$0")" && pwd)/e2e-server.py"
+[ -f "$SERVER" ] || fail "e2e workload not found: $SERVER"
 
 SOCKET_DIR=${CLAUDE_TMUX_SOCKET_DIR:-${TMPDIR:-/tmp}/deemo-tmux-sockets}
 mkdir -p "$SOCKET_DIR"
@@ -55,6 +71,7 @@ wait_for() { # $1 regex, $2 timeout (s)
   done
   echo "FAIL: timed out waiting for: $pattern" >&2
   tmux -S "$SOCKET" capture-pane -p -J -t "$SESSION":0.0 -S -30 | tail -20 >&2
+  dump_logs >&2
   exit 1
 }
 
@@ -73,8 +90,8 @@ echo "== T1: bare 'deemo' in a tty must NOT block (usage error, prompt returns) 
 run "$BIN"
 wait_for 'nothing to do' 10
 
-echo "== T2: deemo -- http.server returns to the shell immediately =="
-run "$BIN --label $LABEL -- python3 -m http.server $PORT --directory $DOCROOT"
+echo "== T2: deemo -- <server> returns to the shell immediately =="
+run "$BIN --label $LABEL -- python3 $SERVER $DOCROOT $PORT"
 wait_for "detached .*(pid [0-9]+)" 10
 run "echo SHELL-BACK"
 wait_for 'SHELL-BACK' 5   # shell accepted the next command => deemo returned
@@ -87,7 +104,7 @@ for ((i = 0; i < 20; i++)); do
   CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/" 2>/dev/null) && [ "$CODE" = 200 ] && break
   sleep 0.4
 done
-[ "$CODE" = 200 ] || fail "http.server did not serve 200 (got: ${CODE:-none})"
+[ "$CODE" = 200 ] || fail "the daemon did not serve 200 (got: ${CODE:-none})"
 echo "   HTTP $CODE"
 
 echo "== T4: deemo ps sees it running =="
@@ -131,7 +148,7 @@ run 'echo BASH-READY-T9'
 wait_for 'BASH-READY-T9' 10
 run 'export PS1="E2E> "'
 LABEL=killee
-run "$BIN --label $LABEL -- python3 -m http.server $PORT --directory $DOCROOT"
+run "$BIN --label $LABEL -- python3 $SERVER $DOCROOT $PORT"
 wait_for "detached .*(pid [0-9]+)" 10
 
 # wait until the server really holds the port; then dry-run must name it
