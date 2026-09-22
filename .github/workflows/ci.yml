@@ -55,3 +55,15 @@ jobs:
         run: sudo apt-get update -y && sudo apt-get install -y tmux
       - run: cargo build --release --locked
       - run: scripts/e2e-tmux.sh target/release/deemo
+
+  e2e-macos:
+    name: e2e (tmux, macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tmux
+        run: brew install tmux
+      - run: cargo build --release --locked
+      - run: scripts/e2e-tmux.sh target/release/deemo

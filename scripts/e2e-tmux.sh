@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # End-to-end self-check for deemo, driven through a REAL terminal (tmux).
 #
+# Scope: only what a real tty can prove — bare `deemo` must not block on a
+# terminal (T1), a daemon survives the terminal closing (T8), live
+# passthrough into a terminal (T2/T3), and the actual Ctrl+C keystroke path
+# (T10). Everything else is a smoke duplicate of tests/*.rs, whose black-box
+# tests (`cargo test`) are the source of truth for behaviour.
+#
 # The benchmark workload is `python3 -m http.server`: a persistent process
 # whose request log goes to *stderr*, so it also proves deemo captures both
 # fds without `2>&1`.
@@ -30,6 +36,7 @@ SESSION="deemo-e2e-$$"
 cleanup() {
   tmux -S "$SOCKET" kill-session -t "$SESSION" 2>/dev/null
   [ -n "${LABEL:-}" ] && DEEMO_HOME="$HOMEDIR" "$BIN" stop "$LABEL" >/dev/null 2>&1
+  pkill -f 'sleep 23\.731' 2>/dev/null   # T10's INT-ignoring child, if left behind
   rm -rf "$HOMEDIR" "$DOCROOT"
   return 0
 }
@@ -73,8 +80,10 @@ run "echo SHELL-BACK"
 wait_for 'SHELL-BACK' 5   # shell accepted the next command => deemo returned
 
 echo "== T3: the daemon actually serves HTTP =="
+# wait until the server actually serves HTTP (bash arithmetic: `seq` is not
+# part of a stock macOS)
 CODE=""
-for _ in $(seq 1 20); do
+for ((i = 0; i < 20; i++)); do
   CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/" 2>/dev/null) && [ "$CODE" = 200 ] && break
   sleep 0.4
 done
@@ -127,7 +136,7 @@ wait_for "detached .*(pid [0-9]+)" 10
 
 # wait until the server really holds the port; then dry-run must name it
 DRY=""
-for _ in $(seq 1 20); do
+for ((i = 0; i < 20; i++)); do
   DRY=$("$BIN" kill "$PORT" --dry-run 2>/dev/null || true)
   [ -n "$DRY" ] && break
   sleep 0.4
@@ -143,5 +152,19 @@ run "$BIN ps"
 wait_for 'no processes' 10   # kill sweeps the registration, like stop does
 LABEL=""   # nothing left for cleanup to stop
 
+echo "== T10: real Ctrl+C keystrokes in foreground: 1st drains, 2nd forces 130 =="
+# The child ignores SIGINT (trap inherited by exec'd sleep), so only deemo's
+# own two-press handler can get us out of the foreground run.
+run "$BIN --foreground --label cctst -- sh -c 'trap \"\" INT; sleep 23.731'"
+wait_for 'supervising: sh -c trap' 10      # handler installed before this line
+tmux -S "$SOCKET" send-keys -t "$SESSION":0.0 C-c
+# NOTE: `[+]` because wait_for greps with ERE — a bare `+` would quantise the
+# preceding letter and match "CtrlC", which never appears.
+wait_for 'press Ctrl[+]C again' 10         # 1st press: announced, keeps draining
+tmux -S "$SOCKET" send-keys -t "$SESSION":0.0 C-c
+run "echo CCTLINES"
+wait_for 'CCTLINES' 10                     # shell accepted the next command => deemo exited (130)
+LABEL=cctst   # not registered (foreground); cleanup's stop is a harmless no-op
+
 echo
-echo "ALL E2E CHECKS PASSED (T1-T9)"
+echo "ALL E2E CHECKS PASSED (T1-T10)"
