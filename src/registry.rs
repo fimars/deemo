@@ -87,6 +87,9 @@ fn parse_entry(file: &Path) -> Option<Entry> {
 /// command would delete the whole registry on the first call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Liveness {
+    /// Constructed only by the unix probe; windows cannot probe, so keep the
+    /// variant (match arms need it) without demanding a constructor there.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Alive,
     Dead,
     /// No probe available on this platform — neither alive nor dead.
@@ -195,12 +198,17 @@ enum StopOutcome {
     /// SIGTERM alone took the group down.
     Terminated,
     /// SIGTERM was ignored; SIGKILL took the group down.
+    /// (The escalation path is unix-only; windows stops through taskkill.)
+    #[cfg_attr(not(unix), allow(dead_code))]
     Killed,
     /// Still alive after SIGKILL (or unsignalable): give up honestly.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Stubborn,
 }
 
+#[cfg(unix)] // the SIGTERM→SIGKILL escalation that waits them out
 const TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(unix)]
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// One `deemo stop` argument. A number is a pid, anything else a label.
