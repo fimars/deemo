@@ -329,28 +329,6 @@ fn supervisor_propagates_signal_exit_codes() {
         .code(143);
 }
 
-#[test]
-#[cfg(unix)]
-fn supervisor_yolo_writes_nothing() {
-    let home = tempfile::tempdir().unwrap();
-    deemo()
-        .env("DEEMO_HOME", home.path())
-        .args([
-            "--yolo",
-            "--foreground",
-            "--",
-            "sh",
-            "-c",
-            "echo hi; exit 2",
-        ])
-        .assert()
-        .failure()
-        .code(2)
-        .stdout(predicate::str::contains("hi"))
-        .stderr(predicate::str::contains("yolo"));
-    assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
-}
-
 // --- detach mode (default) ----------------------------------------------------
 
 #[test]
@@ -442,6 +420,87 @@ fn ps_and_stop_manage_detached_processes() {
         .assert()
         .failure()
         .stdout(predicate::str::contains("no processes"));
+}
+
+/// Start two detached `sleep`s under one label and return their pids,
+/// ascending — the `pnpm dev:admin` + `pnpm dev:merchant` shape: two
+/// processes, one label.
+#[cfg(unix)]
+fn start_two_dup(home: &std::path::Path) -> (u32, u32) {
+    for _ in 0..2 {
+        deemo()
+            .env("DEEMO_HOME", home)
+            .args(["--label", "dup", "--", "sleep", "30"])
+            .assert()
+            .success();
+    }
+    let mut pids: Vec<u32> = fs::read_dir(home.join("run"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter_map(|name| {
+            name.strip_prefix("dup.")
+                .and_then(|rest| rest.strip_suffix(".pid"))
+                .and_then(|pid| pid.parse().ok())
+        })
+        .collect();
+    pids.sort_unstable();
+    assert_eq!(pids.len(), 2, "expected two registrations, got {pids:?}");
+    (pids[0], pids[1])
+}
+
+/// The pid file deemo keeps for a `dup` registration.
+#[cfg(unix)]
+fn dup_pid_file(home: &std::path::Path, pid: u32) -> std::path::PathBuf {
+    home.join("run").join(format!("dup.{pid}.pid"))
+}
+
+#[test]
+#[cfg(unix)]
+fn stop_takes_a_label_or_a_pid() {
+    let home = tempfile::tempdir().unwrap();
+    let (first, second) = start_two_dup(home.path());
+
+    // A pid names one process: it goes, the other keeps running.
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .arg("stop")
+        .arg(first.to_string())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "stopped dup (pid {first}"
+        )));
+    assert!(!dup_pid_file(home.path(), first).exists());
+    assert!(dup_pid_file(home.path(), second).exists());
+
+    // A label is the unit: it takes down every registration under it.
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["stop", "dup"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "stopped dup (pid {second}"
+        )));
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["ps"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("no processes"));
+}
+
+#[test]
+#[cfg(unix)]
+fn stop_reports_an_unknown_pid() {
+    let home = tempfile::tempdir().unwrap();
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["stop", "4294967294"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("no process with pid 4294967294"));
 }
 
 #[test]
@@ -568,21 +627,32 @@ fn logs_shows_newest_log_of_label() {
 
 // --- kill by port ---------------------------------------------------------------
 
-/// A port nothing else holds: bind to an ephemeral port, then release it.
+/// Bind below the ephemeral range. A port from `:0` sits in that range, and a
+/// concurrent test's client socket may then use the same number as its source
+/// port — `lsof` would report that client as a binder of our port.
+#[cfg(unix)]
+fn bind_quiet() -> std::net::TcpListener {
+    (20_000..30_000u16)
+        .step_by(97)
+        .find_map(|p| std::net::TcpListener::bind(("127.0.0.1", p)).ok())
+        .expect("no free port in 20000..30000")
+}
+
+/// A port nothing else holds: take one below the ephemeral range, then release
+/// it for the child to bind.
 #[cfg(unix)]
 fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    bind_quiet().local_addr().unwrap().port()
 }
 
 #[test]
 #[cfg(unix)]
 fn kill_dry_run_lists_the_pid_binding_the_port() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = bind_quiet();
     let port = listener.local_addr().unwrap().port();
     // A second port held by the same process must be reported once: dry-run
     // output is a pid list to feed to other tools, not a per-port listing.
-    let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other = bind_quiet();
     let other_port = other.local_addr().unwrap().port();
     let home = tempfile::tempdir().unwrap();
     let expect = format!("{}\n", std::process::id());

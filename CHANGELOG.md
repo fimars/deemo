@@ -13,6 +13,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`deemo stop` accepts a pid as well as a label.** A label stops every
+  process registered under it; a purely numeric argument stops exactly the
+  process with that pid (the one `deemo ps` prints). Labels default to the
+  program name, so two runs of the same launcher (`pnpm dev:admin`,
+  `pnpm dev:merchant`) share one — the pid is how to stop just one.
 - **`deemo kill <PORT>...`** — free a port without hunting for the pid:
   discovers every process that *binds* it (TCP + UDP, IPv4 + IPv6) and stops
   it with `deemo stop`'s policy — SIGTERM, 5 s grace, SIGKILL, then an honest

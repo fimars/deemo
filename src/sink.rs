@@ -76,9 +76,9 @@ fn belongs_to(name: &str, label: &str) -> bool {
 /// files in total (the current file included — its name carries the newest
 /// timestamp, so it sorts last and is never pruned). `keep == 0` means
 /// unlimited.
-pub fn prune_old_logs(home: &Path, label: &str, keep: u32, current: &Path) -> Result<Vec<PathBuf>> {
+pub fn prune_old_logs(home: &Path, label: &str, keep: u32, current: &Path) -> Result<usize> {
     if keep == 0 {
-        return Ok(Vec::new());
+        return Ok(0);
     }
     let logs_dir = home.join("logs");
 
@@ -94,13 +94,13 @@ pub fn prune_old_logs(home: &Path, label: &str, keep: u32, current: &Path) -> Re
     files.sort();
 
     let excess = files.len().saturating_sub(keep as usize);
-    let mut removed = Vec::new();
+    let mut removed = 0usize;
     for path in files.into_iter().take(excess) {
         if path == current {
             continue; // never prune the file we are writing to
         }
         if fs::remove_file(&path).is_ok() {
-            removed.push(path);
+            removed += 1;
         }
     }
     Ok(removed)

@@ -32,7 +32,8 @@ deemo --foreground -- <CMD>    # stay attached; $? is the child's exit code
 <cmd> | deemo --background     # detach the pipe pump (unix)
 
 deemo ps                       # label, pid, status, log
-deemo stop <LABEL>             # stop it (and what it spawned)
+deemo stop <LABEL>             # stop it (and every process under that label)
+deemo stop 66089               # one pid instead of a label
 deemo logs <LABEL>             # newest log: path + last ~4 KiB
 deemo kill <PORT>              # free a port
 deemo kill 8000 3000           # several ports
@@ -40,7 +41,10 @@ deemo kill 8000 --dry-run      # print pids, one per line
 deemo kill 8000 -s HUP         # that signal only; no SIGKILL afterwards
 ```
 
-`stop` takes a label. `kill` takes a port, including processes deemo did not start.
+`stop` takes a label or a pid. A label stops every process registered under
+it — two `pnpm dev:*` both register as `pnpm` — so to stop just one, read its
+pid off `deemo ps` and pass that. `kill` takes a port, including processes
+deemo did not start.
 
 ## Options
 
@@ -72,7 +76,9 @@ deemo kill 8000 -s HUP         # that signal only; no SIGKILL afterwards
 
 ## Gotchas
 
-- Stop a daemon with `deemo stop <label>`. Ctrl+C does not reach it.
+- Stop a daemon with `deemo stop <label>` (or its pid). A label stops every
+  process registered under it; use the pid to pick one. Ctrl+C does not
+  reach a daemon.
 - `deemo ps` is the manager. `deemo -- ps -ef` runs `ps`.
 - Pipes carry stdout only. Use `2>&1`, or detach mode, to capture stderr.
 - Output is block-buffered when it is not a tty: `python -u`, `PYTHONUNBUFFERED=1`, or `stdbuf -oL`.

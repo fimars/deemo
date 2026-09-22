@@ -16,6 +16,8 @@ The pid file is written only when a log exists. `--yolo` discards output and doe
 
 Detach's pid is the session and group leader. `deemo stop` sends `SIGTERM` to that group (`killpg`), waits 5 seconds, then `SIGKILL`, and waits 1 second more. The pid file is removed only after the group is gone. A survivor keeps its pid file and `stop` exits 1, so a retry still has a target.
 
+A label is not unique: `pnpm dev:admin` and `pnpm dev:merchant` both default to `pnpm`, and `stop pnpm` takes both down. That is what a label means — one label, one unit. To stop just one, read its pid off `deemo ps` and pass that: a numeric argument is a pid, never a label. A label that is all digits is therefore reachable only as a pid; rename it via `--label`.
+
 The group is the unit because launchers (`npm`, `pnpm`, `deno`, `dshx`) spawn the real server as a child. Killing only the registered pid orphans that child and leaves the port bound.
 
 A program that double-forks into a new session leaves the group on purpose. No process-group supervisor, deemo included, can follow it. That is the program's own lifecycle.

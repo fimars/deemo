@@ -41,7 +41,7 @@ fn run(cli: &Cli) -> i32 {
     let home = sink::resolve_home(cli.dir.as_deref());
     match &cli.manage {
         Some(Manage::Ps) => return registry::ps(&home),
-        Some(Manage::Stop { labels }) => return registry::stop(&home, labels),
+        Some(Manage::Stop { targets }) => return registry::stop(&home, targets),
         Some(Manage::Kill {
             ports,
             signal,
@@ -118,10 +118,8 @@ fn prepare_log(cli: &Cli, home: &std::path::Path, mode: LogMode) -> Option<sink:
     }
     if cli.keep > 0 {
         match sink::prune_old_logs(home, &label, cli.keep, &sink.path) {
-            Ok(removed) if !removed.is_empty() => {
-                eprintln!("deemo: pruned {} old log file(s)", removed.len());
-            }
-            Ok(_) => {}
+            Ok(0) => {}
+            Ok(pruned) => eprintln!("deemo: pruned {pruned} old log file(s)"),
             Err(e) => eprintln!("deemo: warning: could not prune old logs: {e:#}"),
         }
     }

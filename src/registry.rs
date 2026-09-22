@@ -175,22 +175,63 @@ enum StopOutcome {
 const TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Stop all processes with the given label(s). Returns an exit code.
-pub fn stop(home: &Path, labels: &[String]) -> i32 {
+/// One `deemo stop` argument. A number is a pid, anything else a label.
+enum Selector {
+    Label(String),
+    Pid(u32),
+}
+
+impl Selector {
+    fn parse(raw: &str) -> Selector {
+        match raw.parse::<u32>() {
+            Ok(pid) => Selector::Pid(pid),
+            Err(_) => Selector::Label(raw.to_string()),
+        }
+    }
+
+    fn matches(&self, entry: &Entry) -> bool {
+        match self {
+            Selector::Label(label) => &entry.label == label,
+            Selector::Pid(pid) => entry.pid == *pid,
+        }
+    }
+
+    /// Phrase for the "matched nothing" message.
+    fn describe(&self) -> String {
+        match self {
+            Selector::Label(label) => format!("label '{label}'"),
+            Selector::Pid(pid) => format!("pid {pid}"),
+        }
+    }
+}
+
+/// Stop the process(es) each argument selects: a label stops every
+/// registration under it, a pid stops exactly one. Returns an exit code.
+pub fn stop(home: &Path, targets: &[String]) -> i32 {
     // Dead registrations must not linger (nor show up as "is not running"):
     // sweep them before matching, like `ps` does.
     sweep_dead(home);
-    let all = list(home);
-    let mut missing = Vec::new();
-    let mut stubborn = false;
-    for label in labels {
-        let mut hits = 0usize;
-        for (entry, alive) in &all {
-            if &entry.label != label {
+    let entries = list(home);
+    let mut failed = false;
+    // `deemo stop pnpm 66089` selects one entry twice: stop it once.
+    let mut handled: HashSet<u32> = HashSet::new();
+    for raw in targets {
+        let selector = Selector::parse(raw);
+        let hits: Vec<&Entry> = entries
+            .iter()
+            .filter(|(entry, _)| selector.matches(entry))
+            .map(|(entry, _)| entry)
+            .collect();
+        if hits.is_empty() {
+            eprintln!("deemo: no process with {}", selector.describe());
+            failed = true;
+            continue;
+        }
+        for entry in hits {
+            if !handled.insert(entry.pid) {
                 continue;
             }
-            hits += 1;
-            if *alive {
+            if alive(entry.pid) {
                 match terminate(Target::Group(entry.pid)) {
                     StopOutcome::Terminated => eprintln!(
                         "deemo: stopped {} (pid {}, SIGTERM to process group)",
@@ -201,7 +242,7 @@ pub fn stop(home: &Path, labels: &[String]) -> i32 {
                         entry.label, entry.pid
                     ),
                     StopOutcome::Stubborn => {
-                        stubborn = true;
+                        failed = true;
                         eprintln!(
                             "deemo: {} (pid {}) survived SIGTERM and SIGKILL; keeping its pid file",
                             entry.label, entry.pid
@@ -214,14 +255,8 @@ pub fn stop(home: &Path, labels: &[String]) -> i32 {
             }
             let _ = fs::remove_file(&entry.file);
         }
-        if hits == 0 {
-            missing.push(label.clone());
-        }
     }
-    for label in &missing {
-        eprintln!("deemo: no process with label '{label}'");
-    }
-    i32::from(stubborn || !missing.is_empty())
+    i32::from(failed)
 }
 
 /// Group for `stop` and for pids deemo started (`setsid` made that group

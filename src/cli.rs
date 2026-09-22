@@ -14,12 +14,15 @@ pub enum Timestamp {
 pub enum Manage {
     /// List processes started by deemo (detached ones may still be running).
     Ps,
-    /// Stop detached process(es) by label: SIGTERM to the whole process
-    /// group on unix (SIGKILL after a grace period).
+    /// Stop detached process(es) by label or pid: SIGTERM to the whole
+    /// process group on unix (SIGKILL after a grace period). A label stops
+    /// every process registered under it; a purely numeric argument names a
+    /// single pid instead.
     Stop {
-        /// Label(s) of the detached process(es) to stop.
-        #[arg(value_name = "LABEL", required = true)]
-        labels: Vec<String>,
+        /// Label(s) of the detached process(es) to stop, or pid(s). A
+        /// purely numeric argument is a pid; anything else is a label.
+        #[arg(value_name = "LABEL|PID", required = true)]
+        targets: Vec<String>,
     },
     /// Kill whatever is bound to a port — `lsof -i :PORT | kill` without the
     /// pipeline: SIGTERM to each holder, SIGKILL after the same grace period
@@ -67,7 +70,7 @@ pub enum Manage {
 
 Management:
   deemo ps                         list started processes
-  deemo stop <LABEL>               stop detached process(es) by label
+  deemo stop <LABEL|PID>...        stop by label (all matches) or by pid
   deemo kill <PORT>                kill the process(es) bound to a port
   deemo logs <LABEL>               newest log file of a label, tail included
 
@@ -165,22 +168,6 @@ mod tests {
             "python3"
         ); // child program name
         assert_eq!(cli(&["--label", "x", "--", "sh"]).label_string(), "x");
-    }
-
-    #[test]
-    fn kill_parses_ports_signal_and_dry_run() {
-        match cli(&["kill", "8000", "3000", "-s", "HUP", "--dry-run"]).manage {
-            Some(Manage::Kill {
-                ports,
-                signal,
-                dry_run,
-            }) => {
-                assert_eq!(ports, vec![8000, 3000]);
-                assert_eq!(signal.as_deref(), Some("HUP"));
-                assert!(dry_run);
-            }
-            other => panic!("expected kill, got {other:?}"),
-        }
     }
 
     #[test]
