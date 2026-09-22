@@ -69,7 +69,13 @@ fn detach_child_runs_in_its_own_session() {
         ])
         .assert()
         .success();
-    let content = wait_for_log(home.path(), "sid-", |c| c.contains("pid="));
+    // The condition is the content we need — BOTH lines — not "the first
+    // line appeared": the poll can catch the log between `echo` and `ps`.
+    let content = wait_for_log(home.path(), "sid-", |c| {
+        let mut probe = c.lines().map(str::trim);
+        probe.next().is_some_and(|l| l.starts_with("pid="))
+            && probe.next().is_some_and(|l| l.parse::<u32>().is_ok())
+    });
     let mut lines = content.lines().map(|l| l.trim());
     let pid: u32 = lines
         .next()
