@@ -168,6 +168,20 @@ pub fn bind_quiet() -> std::net::TcpListener {
         .expect("no free port in 20000..30000")
 }
 
+/// `bind_quiet`'s twin for assertions about a *released* port. The pool
+/// (30000..32000, step 97) lies outside `bind_quiet` (20000..30000),
+/// `free_port` (29000..30000) and the ephemeral range (≥ 32768): between the
+/// drop and the "reads as free" check no sibling's scan and no client's
+/// source port can take the number — `bind_quiet`'s zero-seeded scan re-grabs
+/// a just-released 20000 the moment a late sibling starts.
+#[cfg(unix)]
+pub fn bind_isolated() -> std::net::TcpListener {
+    (30_000..32_000u16)
+        .step_by(97)
+        .find_map(|p| std::net::TcpListener::bind(("127.0.0.1", p)).ok())
+        .expect("no free port in 30000..32000")
+}
+
 /// A port nothing else holds, released for the caller to hand to a child.
 ///
 /// Each call consumes a fresh number from a process-wide descending seed:

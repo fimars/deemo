@@ -10,7 +10,7 @@ use predicates::prelude::*;
 #[cfg(unix)]
 use std::process::Command as StdCommand;
 #[cfg(unix)]
-use support::{bind_quiet, free_port, poll_until, Home};
+use support::{bind_isolated, bind_quiet, free_port, poll_until, Home};
 
 /// README: `--dry-run` "prints the pids that would be killed, one per line".
 /// A pid holding two of the given ports appears once — the output is a pid
@@ -19,23 +19,46 @@ use support::{bind_quiet, free_port, poll_until, Home};
 #[cfg(unix)]
 #[test]
 fn kill_dry_run_lists_the_pid_binding_the_port() {
-    let listener = bind_quiet();
+    // Isolated pool: this test *releases* its ports and then asserts they
+    // read as free. A shared pool would let a sibling's `bind_quiet` re-grab
+    // the number in that gap, and the ephemeral range would let a client's
+    // source port do the same — "free" must be ours to guarantee.
+    let listener = bind_isolated();
     let port = listener.local_addr().unwrap().port();
-    let other = bind_quiet();
+    let other = bind_isolated();
     let other_port = other.local_addr().unwrap().port();
     let home = Home::new();
-    let expect = format!("{}\n", std::process::id());
+    let binder = std::process::id().to_string();
 
-    home.deemo()
+    let out = home
+        .deemo()
         .args([
             "kill",
             &port.to_string(),
             &other_port.to_string(),
             "--dry-run",
         ])
-        .assert()
-        .success()
-        .stdout(predicate::eq(expect.as_str()));
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let listed: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    // Our pid exactly once: both ports are ours, and a per-port listing (or a
+    // missing binder) fails this — that is the doc above, pinned. Not an
+    // exact `[self]` equality, though: while this test holds the listeners, a
+    // sibling test's child forked moments ago still carries the inherited fd
+    // copy until its exec closes it, and the kernel — exactly as lsof would —
+    // truthfully reports that holder. The transient pid list is the
+    // environment's, not deemo's contract.
+    assert_eq!(
+        listed.iter().filter(|p| **p == binder).count(),
+        1,
+        "the binder must be listed exactly once, got: {stdout:?}"
+    );
 
     drop(listener);
     drop(other);
@@ -239,11 +262,20 @@ fn kill_targets_binders_not_clients_connected_to_the_port() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let listed: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
     let binder = std::process::id().to_string();
+    let client_pid = client.id().to_string();
+    // Binder present exactly once (dedup: one pid, one line) — see the
+    // dry-run test for why this is not an exact `[binder]` equality.
     assert_eq!(
-        listed,
-        vec![binder.as_str()],
-        "only the binder is a target, never the client (pid {})",
-        client.id()
+        listed.iter().filter(|p| **p == binder.as_str()).count(),
+        1,
+        "the binder must be listed exactly once, got: {stdout:?}"
+    );
+    // The README sentence, pinned by name: only processes that *bind* the
+    // port are targets, never clients merely connected to it — the one pid
+    // discovery must NOT print, even though it holds a socket on the port.
+    assert!(
+        !listed.contains(&client_pid.as_str()),
+        "the client (pid {client_pid}) connected TO the port and must never be a target: {stdout:?}"
     );
 
     // Cleanup: the client is our child, the listener drops with this scope.
