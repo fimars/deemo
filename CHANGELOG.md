@@ -6,10 +6,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-22
+
 ### Fixed
 
 - `deemo logs <LABEL>` follows the newest file for that label. Name order was
   reversed, so a label with more than one log showed the oldest.
+- **Windows: a management command no longer deletes the whole registry.**
+  There is no cheap std-only liveness probe on Windows, so every process
+  counted as dead while `ps`/`stop`/`kill` swept dead registrations up front
+  — the first `deemo ps` emptied `$DEEMO_HOME/run/`. Liveness is now
+  three-state: `ps` shows `unknown` (never a guessed `dead`/`running`), only
+  a *known*-dead registration is swept, and `stop` still signals through
+  `taskkill /F /T`.
+- `deemo -- <CMD>` (and `--background`) no longer print `stop with: ...` when
+  nothing was registered — `--yolo` and a failed log open leave no pid file,
+  so the advertised command was guaranteed to exit 1.
+- Docs corrected where they contradicted the behaviour (each now pinned by a
+  test): pipe mode exits `0` on EOF rather than the upstream's status;
+  `ps`/`stop`/`logs` exit `1` on empty results; `--yolo` documents that it
+  registers nothing; a purely numeric label can only be stopped by pid.
 
 ### Added
 
@@ -39,6 +55,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `kill` liveness checks (it holds no sockets, and signalling it does
   nothing — without the check a successful kill could be reported as
   "survived SIGTERM and SIGKILL").
+
+### Changed
+
+- The test suite is split by user job (`tests/job_<feature>.rs`) with
+  cross-cutting contracts in `tests/contract_*.rs` (exit codes, SIGINT,
+  `$HOME`/log rules) and Windows coverage in `tests/platform_windows.rs`,
+  sharing `tests/support/`. New: four SIGINT scenarios and the Windows
+  `detach → ps → stop` round-trip. Every test pins the README/DESIGN
+  sentence it enforces; fixed wall-clock assertions that flaked on slow
+  spawns.
+- The tmux end-to-end script declares its scope — only what a real tty can
+  prove — and gained a real Ctrl+C keystroke test; CI now runs it on macOS
+  as well as Linux.
 
 ## [0.1.1] - 2026-09-17
 

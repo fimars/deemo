@@ -1,6 +1,6 @@
 [package]
 name = "deemo"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Persist the stdout of any (long-running) piped process to ~/.deemo — tee with housekeeping"
 license = "MIT"
