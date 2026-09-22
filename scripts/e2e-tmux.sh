@@ -114,5 +114,34 @@ DEEMO_HOME="$HOMEDIR" "$BIN" ps | grep -q "survivor" \
 DEEMO_HOME="$HOMEDIR" "$BIN" stop survivor >/dev/null
 LABEL=survivor   # for cleanup
 
+echo "== T9: deemo kill frees a port =="
+# T8 killed the session, so start a fresh one for the last round.
+tmux -S "$SOCKET" -f /dev/null new-session -d -s "$SESSION" -x 220 -y 50 \
+  "bash --noprofile --norc"
+run 'echo BASH-READY-T9'
+wait_for 'BASH-READY-T9' 10
+run 'export PS1="E2E> "'
+LABEL=killee
+run "$BIN --label $LABEL -- python3 -m http.server $PORT --directory $DOCROOT"
+wait_for "detached .*(pid [0-9]+)" 10
+
+# wait until the server really holds the port; then dry-run must name it
+DRY=""
+for _ in $(seq 1 20); do
+  DRY=$("$BIN" kill "$PORT" --dry-run 2>/dev/null || true)
+  [ -n "$DRY" ] && break
+  sleep 0.4
+done
+[ -n "$DRY" ] || fail "kill --dry-run found nobody on port $PORT"
+echo "   dry-run: pid $DRY"
+
+run "$BIN kill $PORT"
+wait_for "stopped $LABEL" 10
+CODE3=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/" 2>/dev/null || true)
+[ "${CODE3:-000}" != 200 ] || fail "server still serving after kill"
+run "$BIN ps"
+wait_for 'no processes' 10   # kill sweeps the registration, like stop does
+LABEL=""   # nothing left for cleanup to stop
+
 echo
-echo "ALL E2E CHECKS PASSED (T1-T8)"
+echo "ALL E2E CHECKS PASSED (T1-T9)"

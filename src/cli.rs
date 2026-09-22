@@ -21,6 +21,28 @@ pub enum Manage {
         #[arg(value_name = "LABEL", required = true)]
         labels: Vec<String>,
     },
+    /// Kill whatever is bound to a port — `lsof -i :PORT | kill` without the
+    /// pipeline: SIGTERM to each holder, SIGKILL after the same grace period
+    /// `deemo stop` uses (unless `-s` names a signal).
+    ///
+    /// Only processes that *bind* the port locally are targeted (servers),
+    /// never clients merely connected to it.
+    Kill {
+        /// Port(s) to free — TCP and UDP, IPv4 and IPv6, several allowed.
+        #[arg(value_name = "PORT", required = true)]
+        ports: Vec<u16>,
+
+        /// Send exactly this signal instead of the SIGTERM→SIGKILL
+        /// escalation (POSIX `kill -s` / `pkill` style): `TERM`, `HUP`,
+        /// `KILL`, `-9`, … A number or a `SIG`-prefixed name also works.
+        #[arg(short = 's', long, value_name = "SIG", allow_hyphen_values = true)]
+        signal: Option<String>,
+
+        /// Print the pids that would be killed (one per line) and stop
+        /// there — the `lsof -t` view, for scripting.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show the newest log file of a label: its path plus the last ~4 KiB.
     Logs {
         #[arg(value_name = "LABEL")]
@@ -46,12 +68,15 @@ pub enum Manage {
 Management:
   deemo ps                         list started processes
   deemo stop <LABEL>               stop detached process(es) by label
+  deemo kill <PORT>                kill the process(es) bound to a port
   deemo logs <LABEL>               newest log file of a label, tail included
 
 Examples:
   deemo -- python -m http.server 8000
   deemo --foreground --label httpd -- python -m http.server 8000
   python -m http.server 8000 2>&1 | deemo
+  deemo kill 8000                  # free the port: SIGTERM, then SIGKILL
+  deemo kill 8000 --dry-run        # just show which pids that would kill
 
 Note: when stdout is not a tty many programs block-buffer their output
 (detach mode included, since the log file is not a tty). Use `python -u`,
@@ -104,7 +129,7 @@ pub struct Cli {
     )]
     pub command: Vec<String>,
 
-    /// Management subcommands (ps / stop / logs).
+    /// Management subcommands (ps / stop / kill / logs).
     #[command(subcommand)]
     pub manage: Option<Manage>,
 }
@@ -143,16 +168,19 @@ mod tests {
     }
 
     #[test]
-    fn subcommands_parse() {
-        assert!(matches!(cli(&["ps"]).manage, Some(Manage::Ps)));
-        assert!(matches!(
-            cli(&["stop", "a", "b"]).manage,
-            Some(Manage::Stop { .. })
-        ));
-        assert!(matches!(
-            cli(&["logs", "a"]).manage,
-            Some(Manage::Logs { .. })
-        ));
+    fn kill_parses_ports_signal_and_dry_run() {
+        match cli(&["kill", "8000", "3000", "-s", "HUP", "--dry-run"]).manage {
+            Some(Manage::Kill {
+                ports,
+                signal,
+                dry_run,
+            }) => {
+                assert_eq!(ports, vec![8000, 3000]);
+                assert_eq!(signal.as_deref(), Some("HUP"));
+                assert!(dry_run);
+            }
+            other => panic!("expected kill, got {other:?}"),
+        }
     }
 
     #[test]

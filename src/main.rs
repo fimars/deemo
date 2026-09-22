@@ -1,8 +1,10 @@
 mod cli;
+mod port;
 mod registry;
+mod signal;
 mod sink;
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,8 +41,13 @@ fn run(cli: &Cli) -> i32 {
     let home = sink::resolve_home(cli.dir.as_deref());
     match &cli.manage {
         Some(Manage::Ps) => return registry::ps(&home),
-        Some(Manage::Stop { labels }) => return registry::stop_cmd(&home, labels),
-        Some(Manage::Logs { label }) => return registry::logs_cmd(&home, label),
+        Some(Manage::Stop { labels }) => return registry::stop(&home, labels),
+        Some(Manage::Kill {
+            ports,
+            signal,
+            dry_run,
+        }) => return registry::kill(&home, ports, signal.as_deref(), *dry_run),
+        Some(Manage::Logs { label }) => return sink::logs(&home, label),
         None => {}
     }
 
@@ -52,7 +59,7 @@ fn run(cli: &Cli) -> i32 {
             eprintln!("deemo: no command given and stdin is a terminal; nothing to do.");
             eprintln!("  start a daemon:     deemo -- <CMD> [ARGS...]");
             eprintln!("  capture a pipeline: <cmd> | deemo");
-            eprintln!("  manage processes:   deemo ps | deemo stop <LABEL> | deemo logs <LABEL>");
+            eprintln!("  manage processes:   deemo ps | deemo stop <LABEL> | deemo kill <PORT> | deemo logs <LABEL>");
             return 2; // clap's usage-error convention
         }
         // Pipe semantics: EOF arrives only when *every* writer of the pipe
@@ -64,72 +71,61 @@ fn run(cli: &Cli) -> i32 {
         eprintln!(
             "deemo: pipe mode: waiting for stdin to close (all writers must exit; Ctrl+C twice to quit early)"
         );
-        let mut sink = setup_sink(cli, &home);
+        let mut sink = prepare_log(cli, &home, LogMode::Pipe);
         install_ctrlc();
         return pump_pipe(cli, &mut sink, false);
     }
 
     // --- run modes: detach (default) or foreground ------------------------
-    let log_path = if cli.yolo {
-        eprintln!("deemo: --yolo, not writing any logs");
-        None
-    } else {
-        let label = cli.label_string();
-        match sink::Sink::open(&home, &label, cli.timestamp) {
-            Ok(s) => {
-                if cli.keep > 0 {
-                    match sink::prune_old_logs(&home, &label, cli.keep, &s.path) {
-                        Ok(removed) if !removed.is_empty() => {
-                            eprintln!("deemo: pruned {} old log file(s)", removed.len());
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("deemo: warning: could not prune old logs: {e:#}"),
-                    }
-                }
-                Some(s.path)
-            }
-            Err(e) => {
-                eprintln!("deemo: warning: cannot open log file, running without logs: {e:#}");
-                None
-            }
-        }
-    };
-
+    let log = prepare_log(cli, &home, LogMode::Spawn);
     if cli.foreground {
         install_ctrlc();
-        supervise(cli, log_path.as_deref())
+        supervise(cli, log)
     } else {
-        detach(cli, &home, log_path.as_deref())
+        detach(cli, &home, log)
     }
 }
 
-/// Open the log sink (pipe/foreground modes only; detach resolves the path
-/// itself because the child owns the file descriptor).
-fn setup_sink(cli: &Cli, home: &std::path::Path) -> Option<sink::Sink> {
+/// Where a prepared log is announced. The file is the same either way.
+enum LogMode {
+    /// Pipe: print the path now. A failure leaves pure passthrough.
+    Pipe,
+    /// Detach / foreground: the mode itself prints the path after spawn.
+    Spawn,
+}
+
+/// Open this run's log and prune older files for the label.
+/// `None` is `--yolo`, or the file could not be created (already reported).
+fn prepare_log(cli: &Cli, home: &std::path::Path, mode: LogMode) -> Option<sink::Sink> {
     if cli.yolo {
         eprintln!("deemo: --yolo, not writing any logs");
         return None;
     }
     let label = cli.label_string();
-    match sink::Sink::open(home, &label, cli.timestamp) {
-        Ok(s) => {
-            eprintln!("deemo: logging to {}", s.path.display());
-            if cli.keep > 0 {
-                match sink::prune_old_logs(home, &label, cli.keep, &s.path) {
-                    Ok(removed) if !removed.is_empty() => {
-                        eprintln!("deemo: pruned {} old log file(s)", removed.len());
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("deemo: warning: could not prune old logs: {e:#}"),
-                }
-            }
-            Some(s)
-        }
+    let sink = match sink::Sink::open(home, &label, cli.timestamp) {
+        Ok(sink) => sink,
         Err(e) => {
-            eprintln!("deemo: warning: cannot open log file, passthrough only: {e:#}");
-            None
+            let fallback = match mode {
+                LogMode::Pipe => "passthrough only",
+                LogMode::Spawn => "running without logs",
+            };
+            eprintln!("deemo: warning: cannot open log file, {fallback}: {e:#}");
+            return None;
+        }
+    };
+    if matches!(mode, LogMode::Pipe) {
+        eprintln!("deemo: logging to {}", sink.path.display());
+    }
+    if cli.keep > 0 {
+        match sink::prune_old_logs(home, &label, cli.keep, &sink.path) {
+            Ok(removed) if !removed.is_empty() => {
+                eprintln!("deemo: pruned {} old log file(s)", removed.len());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("deemo: warning: could not prune old logs: {e:#}"),
         }
     }
+    Some(sink)
 }
 
 /// Ctrl+C semantics (pipe & foreground modes):
@@ -210,7 +206,7 @@ fn report_log(sink: &Option<sink::Sink>) {
 /// keeps only logging.
 #[cfg(unix)]
 fn pipe_background(cli: &Cli, home: &std::path::Path) -> i32 {
-    let mut sink = setup_sink(cli, home);
+    let mut sink = prepare_log(cli, home, LogMode::Pipe);
     let label = cli.label_string();
 
     match unsafe { libc::fork() } {
@@ -319,7 +315,7 @@ fn pump_pipe(cli: &Cli, sink: &mut Option<sink::Sink>, detached: bool) -> i32 {
 /// Foreground mode: `deemo --foreground -- <CMD>`. Spawn the child, capture
 /// both stdout and stderr (merged, like `2>&1` built in), and exit with the
 /// child's exit code.
-fn supervise(cli: &Cli, log_path: Option<&std::path::Path>) -> i32 {
+fn supervise(cli: &Cli, mut sink: Option<sink::Sink>) -> i32 {
     let cmd = &cli.command;
     eprintln!("deemo: supervising: {}", cmd.join(" "));
 
@@ -356,7 +352,6 @@ fn supervise(cli: &Cli, log_path: Option<&std::path::Path>) -> i32 {
     drop(tx);
 
     let mut stdout = io::stdout();
-    let mut sink = log_path.map(|p| sink::Sink::from_path(p.to_path_buf()));
     while let Ok(line) = rx.recv() {
         match emit_line(&line, &mut stdout, cli.quiet, &mut sink) {
             Ok(()) => {}
@@ -393,25 +388,24 @@ fn supervise(cli: &Cli, log_path: Option<&std::path::Path>) -> i32 {
 /// The child gets its own session (survives terminal close) and its
 /// stdout/stderr point directly at the log file — deemo steps out of the
 /// data path entirely, so it can exit right after spawning.
-fn detach(cli: &Cli, home: &std::path::Path, log_path: Option<&std::path::Path>) -> i32 {
+fn detach(cli: &Cli, home: &std::path::Path, log: Option<sink::Sink>) -> i32 {
     let cmd = &cli.command;
-    let log = match log_path {
-        Some(p) => match OpenOptions::new().append(true).open(p) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("deemo: warning: cannot open log file, output discarded: {e}");
-                open_null_write()
-            }
-        },
-        None => open_null_write(), // --yolo: /dev/null
+    let (log_file, log_path) = match log {
+        Some(sink) => {
+            let (file, path) = sink.into_file();
+            (file, Some(path))
+        }
+        None => (open_null_write(), None),
     };
 
     let mut command = Command::new(&cmd[0]);
     command
         .args(&cmd[1..])
         .stdin(Stdio::from(open_null_read()))
-        .stdout(Stdio::from(log.try_clone().expect("log fd can be cloned")))
-        .stderr(Stdio::from(log));
+        .stdout(Stdio::from(
+            log_file.try_clone().expect("log fd can be cloned"),
+        ))
+        .stderr(Stdio::from(log_file));
 
     #[cfg(unix)]
     {
@@ -442,7 +436,7 @@ fn detach(cli: &Cli, home: &std::path::Path, log_path: Option<&std::path::Path>)
         Err(e) => return spawn_error(&cmd[0], e),
     };
     let pid = child.id();
-    if let Some(path) = log_path {
+    if let Some(path) = log_path.as_deref() {
         if let Err(e) = registry::register(
             home,
             &cli.label_string(),
@@ -455,7 +449,7 @@ fn detach(cli: &Cli, home: &std::path::Path, log_path: Option<&std::path::Path>)
         }
     }
     eprintln!("deemo: detached {cmd:?} (pid {pid})");
-    if let Some(p) = log_path {
+    if let Some(p) = log_path.as_deref() {
         eprintln!("deemo: log: {}", p.display());
     }
     eprintln!("deemo: stop with: deemo stop {}", cli.label_string());

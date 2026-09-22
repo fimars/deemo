@@ -351,32 +351,6 @@ fn supervisor_yolo_writes_nothing() {
     assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
 }
 
-#[test]
-#[cfg(unix)]
-fn supervisor_default_label_is_program_name() {
-    let home = tempfile::tempdir().unwrap();
-    deemo()
-        .env("DEEMO_HOME", home.path())
-        .args(["--", "sh", "-c", "exit 0"])
-        .assert()
-        .success();
-    let names = log_names(home.path());
-    assert_eq!(names.len(), 1);
-    assert!(names[0].starts_with("sh-"), "got {names:?}");
-}
-
-#[test]
-#[cfg(unix)]
-fn supervisor_command_not_found_is_127() {
-    let home = tempfile::tempdir().unwrap();
-    deemo()
-        .env("DEEMO_HOME", home.path())
-        .args(["--", "definitely-not-a-real-cmd-xyz"])
-        .assert()
-        .failure()
-        .code(127);
-}
-
 // --- detach mode (default) ----------------------------------------------------
 
 #[test]
@@ -550,6 +524,20 @@ fn stop_sweeps_dead_registrations_instead_of_keeping_them() {
 
 #[test]
 #[cfg(unix)]
+fn detach_default_label_is_program_name() {
+    let home = tempfile::tempdir().unwrap();
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["--", "sh", "-c", "exit 0"])
+        .assert()
+        .success();
+    let names = log_names(home.path());
+    assert_eq!(names.len(), 1);
+    assert!(names[0].starts_with("sh-"), "got {names:?}");
+}
+
+#[test]
+#[cfg(unix)]
 fn detach_command_not_found_is_127() {
     let home = tempfile::tempdir().unwrap();
     deemo()
@@ -576,6 +564,174 @@ fn logs_shows_newest_log_of_label() {
         .assert()
         .success()
         .stdout(predicate::str::contains("hello-from-detach"));
+}
+
+// --- kill by port ---------------------------------------------------------------
+
+/// A port nothing else holds: bind to an ephemeral port, then release it.
+#[cfg(unix)]
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+#[test]
+#[cfg(unix)]
+fn kill_dry_run_lists_the_pid_binding_the_port() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // A second port held by the same process must be reported once: dry-run
+    // output is a pid list to feed to other tools, not a per-port listing.
+    let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other_port = other.local_addr().unwrap().port();
+    let home = tempfile::tempdir().unwrap();
+    let expect = format!("{}\n", std::process::id());
+
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args([
+            "kill",
+            &port.to_string(),
+            &other_port.to_string(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::eq(expect.as_str()));
+
+    // a released port reads as free (and exits 1, like lsof with no match)
+    drop(listener);
+    drop(other);
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["kill", &port.to_string(), "--dry-run"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("nothing is using port"));
+}
+
+#[test]
+#[cfg(unix)]
+fn kill_sends_exactly_the_requested_signal_without_escalating() {
+    // SIGCONT to a running process is a no-op, so this test process — which
+    // holds the port — must survive `-s CONT`: no SIGTERM→SIGKILL upgrade.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let home = tempfile::tempdir().unwrap();
+
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["kill", &port.to_string(), "-s", "CONT"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "sent SIGCONT to pid {}",
+            std::process::id()
+        )));
+
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["kill", &port.to_string(), "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(std::process::id().to_string()));
+}
+
+#[test]
+#[cfg(unix)]
+fn kill_rejects_unknown_signals_as_a_usage_error() {
+    let home = tempfile::tempdir().unwrap();
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["kill", "8000", "-s", "NOPE"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("unknown signal"));
+}
+
+#[test]
+fn kill_without_a_port_is_a_usage_error() {
+    deemo().args(["kill"]).assert().failure().code(2);
+}
+
+#[test]
+#[cfg(unix)]
+fn kill_frees_the_port_and_sweeps_the_managed_pid_file() {
+    // The e2e workload: a real listener, started through deemo so it is also
+    // a managed pid (kill must then use the group, like `stop`, and sweep the
+    // registration). Skipped — not failed — without python3.
+    if StdCommand::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: python3 not found, cannot bind a port");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let port = free_port();
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args([
+            "--label",
+            "killee",
+            "--",
+            "python3",
+            "-m",
+            "http.server",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+        ])
+        .assert()
+        .success();
+
+    // wait until the server actually holds the port
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let found = deemo()
+            .env("DEEMO_HOME", home.path())
+            .args(["kill", &port.to_string(), "--dry-run"])
+            .output()
+            .unwrap();
+        if !found.stdout.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "http.server never bound port {port}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["kill", &port.to_string()])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("stopped killee"));
+
+    // the port is free again…
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "port {port} still bound after kill"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // …and its registration went with it (housekeeping reuse).
+    deemo()
+        .env("DEEMO_HOME", home.path())
+        .args(["ps"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("no processes"));
 }
 
 // --- pipe mode + --background -------------------------------------------------

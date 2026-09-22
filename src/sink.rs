@@ -27,16 +27,6 @@ pub struct Sink {
 }
 
 impl Sink {
-    /// Attach to an already-created log file (detach/foreground paths).
-    pub fn from_path(path: PathBuf) -> Sink {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .expect("log file was just created and must be reopenable");
-        Sink { file, path }
-    }
-
     /// Create the logs directory and open this run's log file (append mode,
     /// so re-runs with the same name never clobber each other).
     pub fn open(home: &Path, label: &str, scheme: crate::cli::Timestamp) -> Result<Sink> {
@@ -65,11 +55,21 @@ impl Sink {
         Ok(Sink { file, path })
     }
 
-    /// Append raw bytes (already contains the newline, or EOF-truncated tail).
-    #[inline]
+    /// Append raw bytes (already contains the newline, or an EOF-truncated tail).
     pub fn write_line(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.file.write_all(bytes)
     }
+
+    /// Hand the open file to a detached child. The path stays for the pid file.
+    pub fn into_file(self) -> (fs::File, PathBuf) {
+        (self.file, self.path)
+    }
+}
+
+/// A file deemo would have written for `label` (`<label>.log` or `<label>-*.log`).
+fn belongs_to(name: &str, label: &str) -> bool {
+    name == format!("{label}.log")
+        || (name.starts_with(&format!("{label}-")) && name.ends_with(".log"))
 }
 
 /// Delete the oldest log files of the same label, keeping at most `keep`
@@ -81,17 +81,14 @@ pub fn prune_old_logs(home: &Path, label: &str, keep: u32, current: &Path) -> Re
         return Ok(Vec::new());
     }
     let logs_dir = home.join("logs");
-    let prefix = format!("{label}-");
-    let exact = format!("{label}.log");
 
     let mut files: Vec<PathBuf> = fs::read_dir(&logs_dir)
         .with_context(|| format!("failed to read log directory {}", logs_dir.display()))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|p| {
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                return false;
-            };
-            name.ends_with(".log") && (name == exact || name.starts_with(&prefix))
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| belongs_to(name, label))
         })
         .collect();
     files.sort();
@@ -107,4 +104,80 @@ pub fn prune_old_logs(home: &Path, label: &str, keep: u32, current: &Path) -> Re
         }
     }
     Ok(removed)
+}
+
+/// Newest log for a label. Names embed the timestamp, so the greatest name is
+/// the newest run. `--timestamp off` is the single `<label>.log` file.
+fn latest_log(home: &Path, label: &str) -> Option<PathBuf> {
+    let mut best: Option<PathBuf> = None;
+    let entries = fs::read_dir(home.join("logs")).ok()?;
+    for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !belongs_to(name, label) {
+            continue;
+        }
+        let newer = best
+            .as_ref()
+            .is_none_or(|current| path.file_name() > current.file_name());
+        if newer {
+            best = Some(path);
+        }
+    }
+    best
+}
+
+/// Print the path and the last ~4 KiB of a log file.
+fn show_log(path: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let len = f.metadata()?.len();
+    let start = len.saturating_sub(4096);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    println!("{}", path.display());
+    if start > 0 {
+        println!("… (showing last {} of {} bytes)", buf.len(), len);
+    }
+    print!("{}", String::from_utf8_lossy(&buf));
+    if !buf.ends_with(b"\n") {
+        println!();
+    }
+    Ok(())
+}
+
+/// `deemo logs <LABEL>`
+pub fn logs(home: &Path, label: &str) -> i32 {
+    match latest_log(home, label) {
+        Some(path) => match show_log(&path) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("deemo: {e:#}");
+                1
+            }
+        },
+        None => {
+            eprintln!("deemo: no log file found for label '{label}'");
+            1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newest_name_wins_and_other_labels_do_not() {
+        let home = tempfile::tempdir().unwrap();
+        let logs = home.path().join("logs");
+        fs::create_dir(&logs).unwrap();
+        fs::write(logs.join("srv-20200101-000000.000.log"), "old\n").unwrap();
+        fs::write(logs.join("srv-20260922-120000.000.log"), "new\n").unwrap();
+        fs::write(logs.join("other-20260922-120000.000.log"), "nope\n").unwrap();
+        let path = latest_log(home.path(), "srv").unwrap();
+        assert_eq!(path.file_name().unwrap(), "srv-20260922-120000.000.log");
+    }
 }

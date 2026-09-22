@@ -4,6 +4,37 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `deemo logs <LABEL>` follows the newest file for that label. Name order was
+  reversed, so a label with more than one log showed the oldest.
+
+### Added
+
+- **`deemo kill <PORT>...`** — free a port without hunting for the pid:
+  discovers every process that *binds* it (TCP + UDP, IPv4 + IPv6) and stops
+  it with `deemo stop`'s policy — SIGTERM, 5 s grace, SIGKILL, then an honest
+  report if a target survives both. Several ports may be given at once.
+  - `-s <SIG>` switches to POSIX `kill -s` semantics: exactly that signal, no
+    escalation, so `-s HUP` reloads instead of shutting down
+    (`TERM`/`SIGTERM`/`-9`/number all parse).
+  - `--dry-run` prints the pids that would be killed, one per line, and
+    kills nothing — the `lsof -t` view for scripting.
+  - clients merely connected *to* the port are never touched; only the
+    processes that bind it are targeted.
+  - pids deemo started are signalled as their process group (detach makes
+    them session leaders); foreign pids one by one, because their group may
+    be the shell's.
+  - discovery is native on Linux (`/proc/net/*` + `/proc/<pid>/fd`), via
+    `lsof -F pn` on macOS/BSD and `netstat -ano` on Windows.
+- `deemo kill` sweeps the registrations of the processes it killed, so
+  `deemo ps` stays truthful; a zombie now counts as dead in `ps`/`stop`/
+  `kill` liveness checks (it holds no sockets, and signalling it does
+  nothing — without the check a successful kill could be reported as
+  "survived SIGTERM and SIGKILL").
+
 ## [0.1.1] - 2026-09-17
 
 ### Fixed

@@ -1,20 +1,20 @@
-//! Process registry for detached runs: a small pid-file store under
-//! `$DEEMO_HOME/run/` plus listing, liveness probing and stopping.
+//! Pid files for detached runs: `$DEEMO_HOME/run/<label>.<pid>.pid`.
 //!
-//! Stopping kills the whole **process group**, not a single pid: deemo's
-//! detach puts the child in its own session (setsid), so the registered pid
-//! is the session and group leader and every descendant that did not
-//! daemonize itself away lives in that group. A plain `kill(pid)` would only
-//! take down the leader and orphan the rest (launcher -> real server trees
-//! like `dshx` -> `pnpm dsh web`), which is exactly what pid 1 adoption and
-//! a still-bound port look like afterwards.
+//! `stop` signals the process group. Detach calls `setsid`, so the registered
+//! pid is the session leader and `killpg` reaches descendants that stayed in
+//! that group. A launcher that forks the real server without calling `setsid`
+//! again dies with it.
+//!
+//! `kill <port>` signals foreign pids one at a time — their group may be the
+//! user's shell — and deemo's own pids as a group.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-pub struct Entry {
+struct Entry {
     pub pid: u32,
     pub label: String,
     pub started: String,
@@ -23,7 +23,7 @@ pub struct Entry {
     pub file: PathBuf, // the pid-file itself
 }
 
-pub fn run_dir(home: &Path) -> PathBuf {
+fn run_dir(home: &Path) -> PathBuf {
     home.join("run")
 }
 
@@ -80,23 +80,70 @@ fn parse_entry(file: &Path) -> Option<Entry> {
     })
 }
 
-/// Is this pid alive? (Zombies are impossible here: detached children are
-/// reaped by init/launchd after deemo exits. Pid reuse within a short window
-/// is theoretically possible and accepted.)
+/// Is this pid alive?
+///
+/// A zombie counts as **not** alive: it holds no sockets or files any more
+/// (a port it used is free) and signalling it does nothing, so without the
+/// state check `kill(pid, 0)` would report a corpse as running and make a
+/// successful kill look "stubborn". Registered entries never sit in that
+/// state for long (detached children are reaped by init/launchd after deemo
+/// exits); the check matters for `deemo kill <PORT>`, whose targets are
+/// arbitrary processes with arbitrary parents. Pid reuse within a short
+/// window is theoretically possible and accepted.
 #[cfg(unix)]
-pub fn alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+fn alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 && !zombie(pid) }
+}
+
+/// Process state is `Z` — exited, not yet reaped by anyone.
+#[cfg(target_os = "linux")]
+fn zombie(pid: u32) -> bool {
+    // /proc/<pid>/stat: the state is the first field after the
+    // parenthesised command name (which may itself contain spaces).
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('Z'))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn zombie(pid: u32) -> bool {
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as i32;
+    // proc_pidinfo returns the bytes filled in on success and 0 on failure —
+    // and "no such process" is not alive either.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    filled == size && info.pbsi_status == libc::SZOMB
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "ios"))
+))]
+fn zombie(_pid: u32) -> bool {
+    false // no cheap portable state probe here; worst case a reaped-too-late
+          // target is reported as stubborn once
 }
 
 #[cfg(not(unix))]
-pub fn alive(_pid: u32) -> bool {
+fn alive(_pid: u32) -> bool {
     // Windows has no cheap std-only liveness probe; reported as "unknown"
     // rather than guessing. `deemo stop` still works via taskkill.
     false
 }
 
 /// All registered entries + whether each process is still alive.
-pub fn list(home: &Path) -> Vec<(Entry, bool)> {
+fn list(home: &Path) -> Vec<(Entry, bool)> {
     let dir = run_dir(home);
     let mut entries: Vec<(Entry, bool)> = fs::read_dir(&dir)
         .map(|rd| {
@@ -144,7 +191,7 @@ pub fn stop(home: &Path, labels: &[String]) -> i32 {
             }
             hits += 1;
             if *alive {
-                match terminate(entry.pid) {
+                match terminate(Target::Group(entry.pid)) {
                     StopOutcome::Terminated => eprintln!(
                         "deemo: stopped {} (pid {}, SIGTERM to process group)",
                         entry.label, entry.pid
@@ -177,107 +224,116 @@ pub fn stop(home: &Path, labels: &[String]) -> i32 {
     i32::from(stubborn || !missing.is_empty())
 }
 
-#[cfg(unix)]
-fn group_gone(pgid: i32) -> bool {
-    // kill(pgid, 0) succeeds while ANY member of the group exists, so this is
-    // the all-clear test for the whole tree (the leader alone can die first).
-    unsafe { libc::killpg(pgid, 0) != 0 }
+/// Group for `stop` and for pids deemo started (`setsid` made that group
+/// theirs alone). A single pid for everyone else: `killpg` on a server
+/// started in a terminal would also kill the shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// The whole process group led by this pid.
+    Group(u32),
+    /// A single process.
+    Pid(u32),
 }
 
-#[cfg(unix)]
-fn wait_group_gone(pgid: i32, grace: std::time::Duration) -> bool {
-    let deadline = std::time::Instant::now() + grace;
-    while std::time::Instant::now() < deadline {
-        if group_gone(pgid) {
-            return true;
+impl Target {
+    /// The pid everything else is derived from (only windows needs it as a
+    /// value: `taskkill` takes a pid, not a group).
+    #[cfg(not(unix))]
+    fn pid(self) -> u32 {
+        match self {
+            Target::Group(pid) | Target::Pid(pid) => pid,
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    group_gone(pgid)
 }
 
-/// SIGTERM the detached child's whole process group; escalate to SIGKILL when
-/// the grace period passes. Returns whether the group is gone afterwards.
+/// SIGTERM the target; escalate to SIGKILL when the grace period passes.
+/// Returns how the target ended up.
 #[cfg(unix)]
-fn terminate(pid: u32) -> StopOutcome {
-    // The registered pid is the group leader (detach does setsid), so
-    // killpg(pgid=pid) reaches every descendant in one blow.
-    let pgid = pid as i32;
-    unsafe {
-        if libc::killpg(pgid, libc::SIGTERM) != 0 && !group_gone(pgid) {
-            // e.g. EPERM; nothing more we can do
-            return StopOutcome::Stubborn;
-        }
+fn terminate(target: Target) -> StopOutcome {
+    if !target.send(libc::SIGTERM) && !target.gone() {
+        // e.g. EPERM; nothing more we can do
+        return StopOutcome::Stubborn;
     }
-    if wait_group_gone(pgid, TERM_GRACE) {
+    if wait_gone(target, TERM_GRACE) {
         return StopOutcome::Terminated;
     }
-    unsafe {
-        libc::killpg(pgid, libc::SIGKILL);
-    }
-    if wait_group_gone(pgid, KILL_GRACE) {
+    target.send(libc::SIGKILL);
+    if wait_gone(target, KILL_GRACE) {
         StopOutcome::Killed
     } else {
         StopOutcome::Stubborn
     }
 }
 
+#[cfg(unix)]
+impl Target {
+    /// Deliver `sig`; `false` = the kernel refused it (ESRCH / EPERM).
+    fn send(&self, sig: i32) -> bool {
+        match *self {
+            // killpg reaches every member of the group in one blow — see the
+            // module header for why that is the right unit for `stop`.
+            Target::Group(pgid) => unsafe { libc::killpg(pgid as i32, sig) == 0 },
+            Target::Pid(pid) => unsafe { libc::kill(pid as i32, sig) == 0 },
+        }
+    }
+
+    /// Nothing responds to a probe any more.
+    fn gone(&self) -> bool {
+        match *self {
+            // kill(pgid, 0) succeeds while ANY member of the group exists,
+            // so this is the all-clear test for the whole tree (the leader
+            // alone can die first).
+            Target::Group(pgid) => unsafe { libc::killpg(pgid as i32, 0) != 0 },
+            Target::Pid(pid) => !alive(pid),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_gone(target: Target, grace: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if target.gone() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    target.gone()
+}
+
 #[cfg(not(unix))]
-fn terminate(pid: u32) -> StopOutcome {
+fn terminate(target: Target) -> StopOutcome {
     // No std-only signal API on Windows; taskkill /F /T (tree) is the
     // pragmatic route. Liveness is unknowable here, so report success.
     let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .args(["/F", "/T", "/PID", &target.pid().to_string()])
         .status();
     StopOutcome::Terminated
 }
 
+/// POSIX `kill -s SIG`: deliver exactly this signal and stop there — no
+/// escalation. That is what makes `-s HUP` a *reload* instead of a shutdown.
+#[cfg(unix)]
+fn signal_once(target: Target, sig: i32) -> Result<(), String> {
+    if target.send(sig) {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_once(_target: Target, sig: i32) -> Result<(), String> {
+    Err(crate::signal::display(sig) + " cannot be sent on Windows; drop -s to use taskkill")
+}
+
 /// Remove pid-files whose processes are no longer alive (housekeeping for ps).
-pub fn sweep_dead(home: &Path) {
+fn sweep_dead(home: &Path) {
     for (entry, alive) in list(home) {
         if !alive {
             let _ = fs::remove_file(entry.file);
         }
     }
-}
-
-/// Newest log file for a label (filenames embed the timestamp, so sorting
-/// names sorts by time). `--timestamp off` resolves to the single file.
-pub fn latest_log(home: &Path, label: &str) -> Option<PathBuf> {
-    let logs = home.join("logs");
-    let mut best: Option<PathBuf> = None;
-    if let Ok(rd) = fs::read_dir(&logs) {
-        for p in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let matches = name.starts_with(&format!("{label}-")) || name == format!("{label}.log");
-            if matches && best.as_ref().is_none_or(|b| b.file_name() > p.file_name()) {
-                best = Some(p);
-            }
-        }
-    }
-    best
-}
-
-/// Print the path and the last ~4 KiB of a log file.
-pub fn show_log(path: &Path) -> Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    let len = f.metadata()?.len();
-    let start = len.saturating_sub(4096);
-    f.seek(SeekFrom::Start(start))?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    println!("{}", path.display());
-    if start > 0 {
-        println!("… (showing last {} of {} bytes)", buf.len(), len);
-    }
-    print!("{}", String::from_utf8_lossy(&buf));
-    if !buf.ends_with(b"\n") {
-        println!();
-    }
-    Ok(())
 }
 
 /// `deemo ps` — human table. Exit code 1 when nothing is running.
@@ -303,24 +359,114 @@ pub fn ps(home: &Path) -> i32 {
     0
 }
 
-/// `deemo stop ...`
-pub fn stop_cmd(home: &Path, labels: &[String]) -> i32 {
-    stop(home, labels)
-}
+/// `deemo kill <PORT>...` — stop whatever is bound to the port(s).
+///
+/// Default policy is `stop`'s: SIGTERM, 5 s grace, SIGKILL, then an honest
+/// report if a target survives both. `-s` switches to POSIX `kill -s`
+/// semantics (exactly that signal, no escalation — `-s HUP` reloads), and
+/// `--dry-run` only lists the pids, like `lsof -t`.
+pub fn kill(home: &Path, ports: &[u16], signal: Option<&str>, dry_run: bool) -> i32 {
+    let sig = match signal.map(crate::signal::parse).transpose() {
+        Ok(sig) => sig,
+        Err(e) => {
+            eprintln!("deemo: {e}");
+            return 2; // usage error, clap's convention
+        }
+    };
 
-/// `deemo logs <LABEL>`
-pub fn logs_cmd(home: &Path, label: &str) -> i32 {
-    match latest_log(home, label) {
-        Some(path) => match show_log(&path) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("deemo: {e:#}");
-                1
+    // Which pids did deemo itself start? Those are session leaders (detach
+    // ran setsid), so their process group is their own — signalling it also
+    // takes their launcher tree down, exactly like `stop`. Every other pid
+    // is signalled alone: its group may be your shell's.
+    let managed: HashMap<u32, String> = list(home)
+        .into_iter()
+        .filter(|&(_, alive)| alive)
+        .map(|(entry, _)| (entry.pid, entry.label))
+        .collect();
+
+    let mut failed = false;
+    let mut empty: Vec<u16> = Vec::new();
+    // Each pid is listed once, under the first port it was found on.
+    let mut plan: Vec<(u16, u32)> = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+
+    for &port in ports {
+        match crate::port::holders(port) {
+            Ok(pids) if pids.is_empty() => empty.push(port),
+            Ok(pids) => {
+                for pid in pids {
+                    if seen.insert(pid) {
+                        plan.push((port, pid));
+                    }
+                }
             }
-        },
-        None => {
-            eprintln!("deemo: no log file found for label '{label}'");
-            1
+            Err(e) => {
+                eprintln!("deemo: cannot list the processes on port {port}: {e}");
+                failed = true;
+            }
         }
     }
+
+    if dry_run {
+        for (_, pid) in &plan {
+            println!("{pid}");
+        }
+    } else {
+        for &(port, pid) in &plan {
+            let group = managed.contains_key(&pid);
+            let target = if group {
+                Target::Group(pid)
+            } else {
+                Target::Pid(pid)
+            };
+            let subject = match managed.get(&pid) {
+                Some(label) => format!("{label} (pid {pid})"),
+                None => format!("pid {pid}"),
+            };
+
+            if let Some(sig) = sig {
+                match signal_once(target, sig) {
+                    Ok(()) => eprintln!(
+                        "deemo: port {port}: sent {} to {subject}",
+                        crate::signal::display(sig)
+                    ),
+                    Err(e) => {
+                        eprintln!("deemo: port {port}: cannot signal {subject}: {e}");
+                        failed = true;
+                    }
+                }
+                continue;
+            }
+
+            let unit = if group {
+                "SIGTERM to process group"
+            } else {
+                "SIGTERM"
+            };
+            match terminate(target) {
+                StopOutcome::Terminated => {
+                    eprintln!("deemo: port {port}: stopped {subject} ({unit})")
+                }
+                StopOutcome::Killed => {
+                    eprintln!("deemo: port {port}: stopped {subject} (SIGKILL after grace period)")
+                }
+                StopOutcome::Stubborn => {
+                    failed = true;
+                    eprintln!("deemo: port {port}: {subject} survived SIGTERM and SIGKILL");
+                }
+            }
+        }
+    }
+
+    for port in &empty {
+        eprintln!("deemo: nothing is using port {port}");
+    }
+    if !empty.is_empty() {
+        failed = true;
+    }
+
+    // Housekeeping: a killed pid may have been a deemo-managed process —
+    // drop the registration of everything that just died, like ps/stop do.
+    sweep_dead(home);
+    i32::from(failed)
 }
