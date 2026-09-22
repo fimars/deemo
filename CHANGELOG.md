@@ -6,6 +6,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- The suite is green on all three CI platforms. Three latent test defects:
+  the `/proc/net` parser fixture used `0x1F90` (8080) while claiming 8000 —
+  and was gated to Linux, so no other platform ever ran it; `job_kill`
+  imported unix-only helpers unconditionally, which failed the Windows
+  build; and the macOS binder test plus the tmux e2e raced `python3 -m
+  http.server`'s `getfqdn()` reverse-DNS lookup between `bind()` and
+  `listen()` — on CI runners that lookup stalls for up to a minute, so the
+  tests measured the runner's DNS instead of deemo. The e2e workload is now
+  `scripts/e2e-server.py` (bind, listen, same stderr request log), the
+  binder test listens from the test process itself, and e2e failures dump
+  the captured logs.
+
 ## [0.2.0] - 2026-09-22
 
 ### Fixed
