@@ -96,8 +96,14 @@ Why stop, kill, and detach behave this way: [DESIGN.md](DESIGN.md).
 ## Development
 
 ```bash
-cargo test
-scripts/e2e-tmux.sh    # tmux smoke: http.server, ps, logs, stop, kill
+cargo test            # black-box suite: tests/job_<feature>.rs per user job,
+                      # tests/contract_*.rs for cross-cutting contracts
+                      # (exit codes, signals, log/home rules), tests/support/
+                      # the shared harness; unit tests stay next to the code
+scripts/e2e-tmux.sh    # tmux smoke: only what a real tty can prove
 ```
+
+Every test pins a README/DESIGN sentence in its comment; change the docs or
+the behaviour and a test should notice.
 
 macOS, Linux, and Windows. MIT.
