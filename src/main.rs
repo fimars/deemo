@@ -231,10 +231,11 @@ fn pipe_background(cli: &Cli, home: &std::path::Path) -> i32 {
         }
         pid => {
             eprintln!("deemo: backgrounded (pid {pid}); will exit when every pipe writer closes");
+            // Hint only when the child registered a pid file to answer it.
             if let Some(s) = &sink {
                 eprintln!("deemo: log: {}", s.path.display());
+                eprintln!("deemo: stop with: deemo stop {label}");
             }
-            eprintln!("deemo: stop with: deemo stop {label}");
             EXIT_OK
         }
     }
@@ -434,8 +435,11 @@ fn detach(cli: &Cli, home: &std::path::Path, log: Option<sink::Sink>) -> i32 {
         Err(e) => return spawn_error(&cmd[0], e),
     };
     let pid = child.id();
+    // The `stop with:` hint is only honest when a registration exists to
+    // answer it (--yolo and a failed log open both leave us unregistered).
+    let mut registered = false;
     if let Some(path) = log_path.as_deref() {
-        if let Err(e) = registry::register(
+        match registry::register(
             home,
             &cli.label_string(),
             pid,
@@ -443,14 +447,17 @@ fn detach(cli: &Cli, home: &std::path::Path, log: Option<sink::Sink>) -> i32 {
             &cmd.join(" "),
             path,
         ) {
-            eprintln!("deemo: warning: could not register pid file: {e:#}");
+            Ok(()) => registered = true,
+            Err(e) => eprintln!("deemo: warning: could not register pid file: {e:#}"),
         }
     }
     eprintln!("deemo: detached {cmd:?} (pid {pid})");
     if let Some(p) = log_path.as_deref() {
         eprintln!("deemo: log: {}", p.display());
     }
-    eprintln!("deemo: stop with: deemo stop {}", cli.label_string());
+    if registered {
+        eprintln!("deemo: stop with: deemo stop {}", cli.label_string());
+    }
     EXIT_OK
 }
 

@@ -10,7 +10,7 @@ On unix the child calls `setsid` before `exec`. A fresh child is not a process-g
 
 stdin is `/dev/null` (or `NUL`). A daemon that reads stdin would otherwise stall on a closed terminal. stdout and stderr are the log file itself, so deemo exits after spawn and is not in the data path. Line order between the two streams is nondeterministic, same as shell `2>&1`.
 
-The pid file is written only when a log exists. `--yolo` discards output and does not register the process.
+The pid file is written only when a log exists. `--yolo` discards output and does not register the process. Without a registration there is nothing for `stop` to find, so the `stop with:` hint is withheld too — deemo never hands out a command that is guaranteed to fail.
 
 ## Stop is a process group
 
@@ -22,7 +22,7 @@ The group is the unit because launchers (`npm`, `pnpm`, `deno`, `dshx`) spawn th
 
 A program that double-forks into a new session leaves the group on purpose. No process-group supervisor, deemo included, can follow it. That is the program's own lifecycle.
 
-On Windows, `taskkill /F /T` is a hard tree kill. There is no cheap liveness probe, so `ps` does not claim a process is running.
+On Windows, `taskkill /F /T` is a hard tree kill. There is no cheap liveness probe, so liveness is *unknown* there: `ps` shows `unknown` instead of `running`, registrations are never swept as dead, and `stop` still signals through `taskkill`. Sweeping what cannot be probed would delete the registry on the very first `ps`.
 
 ## Kill is a port
 
@@ -48,7 +48,10 @@ After a kill, registrations whose pids are gone are swept, so `ps` does not keep
 
 ## Pipe
 
-A pipe is a filter. It stays in the foreground and exits with the upstream's status. EOF arrives only when every writer closes. If the upstream daemonizes and keeps the write end, deemo waits, and it says so at startup. The way out is detach mode, or `--background`.
+A pipe is a filter. It stays in the foreground and exits `0` on EOF — with
+its own status, like `tee`: a pipe cannot carry the upstream's exit code, and
+a pipeline's `$?` is the last command's by shell convention anyway. EOF
+arrives only when every writer closes. If the upstream daemonizes and keeps the write end, deemo waits, and it says so at startup. The way out is detach mode, or `--background`.
 
 `--background` (unix) forks the pump into its own session and returns immediately. The child is registered and shows up in `ps`. If the terminal disappears, passthrough is dropped and logging continues until the writers close.
 
@@ -78,4 +81,4 @@ If the log cannot be created, the command still runs and a warning is printed. A
 
 Detach exits 0 once the child has been spawned. The child's later fate is `ps` / `stop` / the log, not `$?`.
 
-`127` is the shell's "command not found". `2` is clap's usage error: bare `deemo` on a terminal, `kill` with no port, or an unknown `-s`. A free port and a process that survives both signals are `1`, because the operation did not do what was asked.
+`127` is the shell's "command not found". `2` is clap's usage error: bare `deemo` on a terminal, `kill` with no port, or an unknown `-s`. `1` means the operation did not do what was asked: a free port, a process that survives both signals, `ps` with nothing to list, `stop` matching nothing, `logs` with no file for the label. Pipe mode exits `0` on EOF — see Pipe above.

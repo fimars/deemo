@@ -54,7 +54,7 @@ deemo did not start.
 | `--timestamp <off\|day\|run>` | `<label>.log`, `<label>-YYYYmmdd.log`, or one file per run (default `run`) |
 | `--keep <N>` | Keep N newest logs for this label (0 = unlimited) |
 | `--dir <DIR>` | Overrides `$DEEMO_HOME` |
-| `--yolo` | No log files |
+| `--yolo` | No log files and no registration: nothing shows in `ps`, nothing to `stop` (`kill <PORT>` still works) |
 | `--quiet` | Log only, no echo (foreground and pipe) |
 | `-F`, `--foreground` | Stay attached |
 | `-B`, `--background` | Pipe mode: detach the pump |
@@ -67,9 +67,13 @@ deemo did not start.
 |---|---|
 | Detach spawned | `0` |
 | Command not found | `127` |
-| Foreground / pipe | child's code; signal N → `128+N` |
+| Foreground | child's code; signal N → `128+N` |
+| Pipe, EOF reached | `0` (a filter exits with its own status; a pipe cannot carry the upstream's) |
 | Pipe, Ctrl+C | `130` |
 | Pipe, downstream closed (`\| head`) | `0` |
+| `ps`, nothing running | `1` |
+| `stop`, no target matched | `1` |
+| `logs`, no log for the label | `1` |
 | `kill`: port free, or target survived | `1` |
 | `kill`: bad `-s`, or no port | `2` |
 | Bare `deemo` in a terminal | `2` |
@@ -83,6 +87,9 @@ deemo did not start.
 - Pipes carry stdout only. Use `2>&1`, or detach mode, to capture stderr.
 - Output is block-buffered when it is not a tty: `python -u`, `PYTHONUNBUFFERED=1`, or `stdbuf -oL`.
 - A pipe stays open until every writer closes. For a daemon, use `deemo -- <CMD>` or `deemo --background`.
+- `stop` reads a purely numeric argument as a pid, so a label made of digits
+  (say `--label 123`) can never be stopped *as a label* — pass its pid or
+  rename it with `--label`.
 
 Why stop, kill, and detach behave this way: [DESIGN.md](DESIGN.md).
 

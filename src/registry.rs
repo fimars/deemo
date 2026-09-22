@@ -80,6 +80,21 @@ fn parse_entry(file: &Path) -> Option<Entry> {
     })
 }
 
+/// What deemo can honestly say about a registered process.
+///
+/// The distinction matters: only `Dead` may be swept. `Unknown` (Windows has
+/// no cheap std-only probe) must keep its registration, or every management
+/// command would delete the whole registry on the first call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    Alive,
+    Dead,
+    /// No probe available on this platform — neither alive nor dead.
+    /// (Only *constructed* where there is no probe; unix still matches it.)
+    #[cfg_attr(unix, allow(dead_code))]
+    Unknown,
+}
+
 /// Is this pid alive?
 ///
 /// A zombie counts as **not** alive: it holds no sockets or files any more
@@ -91,8 +106,18 @@ fn parse_entry(file: &Path) -> Option<Entry> {
 /// arbitrary processes with arbitrary parents. Pid reuse within a short
 /// window is theoretically possible and accepted.
 #[cfg(unix)]
+fn liveness(pid: u32) -> Liveness {
+    let alive = unsafe { libc::kill(pid as i32, 0) == 0 } && !zombie(pid);
+    if alive {
+        Liveness::Alive
+    } else {
+        Liveness::Dead
+    }
+}
+
+#[cfg(unix)]
 fn alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 && !zombie(pid) }
+    liveness(pid) == Liveness::Alive
 }
 
 /// Process state is `Z` — exited, not yet reaped by anyone.
@@ -136,24 +161,27 @@ fn zombie(_pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn alive(_pid: u32) -> bool {
-    // Windows has no cheap std-only liveness probe; reported as "unknown"
-    // rather than guessing. `deemo stop` still works via taskkill.
-    false
+fn liveness(_pid: u32) -> Liveness {
+    // Windows has no cheap std-only liveness probe. Reporting `Unknown`
+    // instead of guessing keeps `ps` truthful ("unknown", not "running")
+    // and — crucially — keeps the registration: `stop` still works through
+    // `taskkill /F /T`, and sweeping what we cannot probe would delete the
+    // registry on the first management call.
+    Liveness::Unknown
 }
 
-/// All registered entries + whether each process is still alive.
-fn list(home: &Path) -> Vec<(Entry, bool)> {
+/// All registered entries + what each process's liveness is.
+fn list(home: &Path) -> Vec<(Entry, Liveness)> {
     let dir = run_dir(home);
-    let mut entries: Vec<(Entry, bool)> = fs::read_dir(&dir)
+    let mut entries: Vec<(Entry, Liveness)> = fs::read_dir(&dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|e| e == "pid"))
                 .filter_map(|p| {
                     let entry = parse_entry(&p)?;
-                    let alive = alive(entry.pid);
-                    Some((entry, alive))
+                    let liveness = liveness(entry.pid);
+                    Some((entry, liveness))
                 })
                 .collect()
         })
@@ -231,27 +259,34 @@ pub fn stop(home: &Path, targets: &[String]) -> i32 {
             if !handled.insert(entry.pid) {
                 continue;
             }
-            if alive(entry.pid) {
-                match terminate(Target::Group(entry.pid)) {
-                    StopOutcome::Terminated => eprintln!(
-                        "deemo: stopped {} (pid {}, SIGTERM to process group)",
-                        entry.label, entry.pid
-                    ),
-                    StopOutcome::Killed => eprintln!(
-                        "deemo: stopped {} (pid {}, SIGKILL after grace period)",
-                        entry.label, entry.pid
-                    ),
-                    StopOutcome::Stubborn => {
-                        failed = true;
-                        eprintln!(
-                            "deemo: {} (pid {}) survived SIGTERM and SIGKILL; keeping its pid file",
+            match liveness(entry.pid) {
+                Liveness::Dead => {
+                    eprintln!("deemo: {} (pid {}) is not running", entry.label, entry.pid);
+                }
+                // Alive (unix) and Unknown (Windows, no probe) both take the
+                // same road: `terminate` is the platform's stop primitive.
+                Liveness::Alive | Liveness::Unknown => {
+                    match terminate(Target::Group(entry.pid)) {
+                        StopOutcome::Terminated => eprintln!(
+                            "deemo: stopped {} (pid {}, {})",
+                            entry.label,
+                            entry.pid,
+                            stop_method(true)
+                        ),
+                        StopOutcome::Killed => eprintln!(
+                            "deemo: stopped {} (pid {}, SIGKILL after grace period)",
                             entry.label, entry.pid
-                        );
-                        continue; // keep the registration so the user can retry
+                        ),
+                        StopOutcome::Stubborn => {
+                            failed = true;
+                            eprintln!(
+                                "deemo: {} (pid {}) survived SIGTERM and SIGKILL; keeping its pid file",
+                                entry.label, entry.pid
+                            );
+                            continue; // keep the registration so the user can retry
+                        }
                     }
                 }
-            } else {
-                eprintln!("deemo: {} (pid {}) is not running", entry.label, entry.pid);
             }
             let _ = fs::remove_file(&entry.file);
         }
@@ -362,10 +397,28 @@ fn signal_once(_target: Target, sig: i32) -> Result<(), String> {
     Err(crate::signal::display(sig) + " cannot be sent on Windows; drop -s to use taskkill")
 }
 
-/// Remove pid-files whose processes are no longer alive (housekeeping for ps).
+/// How `terminate` stops a group on this platform — quoted in `stop`'s
+/// report so the message never claims a signal the platform never sent.
+#[cfg(unix)]
+fn stop_method(group: bool) -> &'static str {
+    if group {
+        "SIGTERM to process group"
+    } else {
+        "SIGTERM"
+    }
+}
+
+#[cfg(not(unix))]
+fn stop_method(_group: bool) -> &'static str {
+    "taskkill /F /T"
+}
+
+/// Remove pid-files whose processes are **known** to be dead (housekeeping
+/// for ps). `Unknown` registrations are kept — sweeping them would erase the
+/// registry on platforms without a liveness probe.
 fn sweep_dead(home: &Path) {
-    for (entry, alive) in list(home) {
-        if !alive {
+    for (entry, liveness) in list(home) {
+        if liveness == Liveness::Dead {
             let _ = fs::remove_file(entry.file);
         }
     }
@@ -383,8 +436,12 @@ pub fn ps(home: &Path) -> i32 {
         "{:<16} {:>7}  {:<9} {:<19} COMMAND / LOG",
         "LABEL", "PID", "STATUS", "STARTED"
     );
-    for (e, alive) in &rows {
-        let status = if *alive { "running" } else { "dead" };
+    for (e, liveness) in &rows {
+        let status = match liveness {
+            Liveness::Alive => "running",
+            Liveness::Dead => "dead",
+            Liveness::Unknown => "unknown",
+        };
         let detail = format!("{} -> {}", e.cmd, e.log.display());
         println!(
             "{:<16} {:>7}  {:<9} {:<19} {}",
@@ -415,7 +472,7 @@ pub fn kill(home: &Path, ports: &[u16], signal: Option<&str>, dry_run: bool) -> 
     // is signalled alone: its group may be your shell's.
     let managed: HashMap<u32, String> = list(home)
         .into_iter()
-        .filter(|&(_, alive)| alive)
+        .filter(|&(_, liveness)| liveness != Liveness::Dead)
         .map(|(entry, _)| (entry.pid, entry.label))
         .collect();
 
@@ -473,11 +530,7 @@ pub fn kill(home: &Path, ports: &[u16], signal: Option<&str>, dry_run: bool) -> 
                 continue;
             }
 
-            let unit = if group {
-                "SIGTERM to process group"
-            } else {
-                "SIGTERM"
-            };
+            let unit = stop_method(group);
             match terminate(target) {
                 StopOutcome::Terminated => {
                     eprintln!("deemo: port {port}: stopped {subject} ({unit})")
