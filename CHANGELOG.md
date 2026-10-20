@@ -8,6 +8,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `ps` is readable again. The table now sizes its columns to the
+  content (a label longer than the old hard-coded 16 chars collapsed
+  every column after it), shows the age relative to now (`3d`, `5h`)
+  instead of the 19-character absolute stamp, and extracts the port
+  from the recorded command line (`--port N`, `--port=N`, `-p N`,
+  `PORT=N`) into its own column. The log path left the default table —
+  `deemo logs <LABEL>` resolves it; `ps -v` still prints it, with the
+  absolute start time. Long commands are cut with an ellipsis to the
+  terminal width (`COLUMNS` wins over the tty, piped output is left
+  uncapped), and a tty gets a colored status.
 - The suite is green on all three CI platforms. Three latent test defects:
   the `/proc/net` parser fixture used `0x1F90` (8080) while claiming 8000 —
   and was gated to Linux, so no other platform ever ran it; `job_kill`

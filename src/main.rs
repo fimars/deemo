@@ -40,7 +40,7 @@ fn run(cli: &Cli) -> i32 {
     // --- management subcommands ------------------------------------------
     let home = sink::resolve_home(cli.dir.as_deref());
     match &cli.manage {
-        Some(Manage::Ps) => return registry::ps(&home),
+        Some(Manage::Ps { verbose }) => return registry::ps(&home, *verbose),
         Some(Manage::Stop { targets }) => return registry::stop(&home, targets),
         Some(Manage::Kill {
             ports,

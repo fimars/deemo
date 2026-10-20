@@ -13,7 +13,13 @@ pub enum Timestamp {
 #[derive(Debug, Subcommand)]
 pub enum Manage {
     /// List processes started by deemo (detached ones may still be running).
-    Ps,
+    Ps {
+        /// Full detail: absolute start time and the log path per row. The
+        /// default table shows the relative age instead and leaves the log
+        /// path to `deemo logs <LABEL>`.
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Stop detached process(es) by label or pid: SIGTERM to the whole
     /// process group on unix (SIGKILL after a grace period). A label stops
     /// every process registered under it; a purely numeric argument names a

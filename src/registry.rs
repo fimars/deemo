@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -432,31 +433,234 @@ fn sweep_dead(home: &Path) {
     }
 }
 
+/// Cap for the label column: a label is the row's key (you `stop` by it), so
+/// be generous, but an absurd label must not eat the whole terminal.
+const LABEL_MAX: usize = 32;
+/// Never truncate a command shorter than this to squeeze a row into the
+/// terminal — a useless stub ("b…") is worse than one wrapped line.
+const CMD_MIN: usize = 16;
+
 /// `deemo ps` — human table. Exit code 1 when nothing is running.
-pub fn ps(home: &Path) -> i32 {
+pub fn ps(home: &Path, verbose: bool) -> i32 {
     sweep_dead(home);
     let rows = list(home);
     if rows.is_empty() {
         println!("no processes started by deemo");
         return 1;
     }
-    println!(
-        "{:<16} {:>7}  {:<9} {:<19} COMMAND / LOG",
-        "LABEL", "PID", "STATUS", "STARTED"
-    );
-    for (e, liveness) in &rows {
-        let status = match liveness {
-            Liveness::Alive => "running",
-            Liveness::Dead => "dead",
-            Liveness::Unknown => "unknown",
+
+    let color = std::io::stdout().is_terminal();
+    let width = output_width();
+
+    struct Row {
+        label: String,
+        pid: String,
+        status: &'static str,
+        age: String,   // relative age; the raw `started` stamp in verbose
+        ports: String, // "4322", "3000,3001", or "-" when the cmd names none
+        cmd: String,   // truncated to the terminal width (already)
+        log: String,   // verbose only
+    }
+
+    let mut data: Vec<Row> = rows
+        .iter()
+        .map(|(e, liveness)| {
+            let status = match liveness {
+                Liveness::Alive => "running",
+                Liveness::Dead => "dead",
+                Liveness::Unknown => "unknown",
+            };
+            let age = if verbose {
+                e.started.clone()
+            } else {
+                age_of(&e.started).map_or_else(|| "?".to_string(), format_age)
+            };
+            let found = ports_in(&e.cmd);
+            Row {
+                label: truncate(&e.label, LABEL_MAX),
+                pid: e.pid.to_string(),
+                status,
+                age,
+                ports: if found.is_empty() {
+                    "-".to_string()
+                } else {
+                    found.join(",")
+                },
+                cmd: e.cmd.clone(),
+                log: e.log.display().to_string(),
+            }
+        })
+        .collect();
+
+    let mut label_w = "LABEL".len();
+    let mut age_w = if verbose {
+        "STARTED".len()
+    } else {
+        "AGE".len()
+    };
+    let mut port_w = "PORT".len();
+    for r in &data {
+        label_w = label_w.max(r.label.chars().count());
+        age_w = age_w.max(r.age.chars().count());
+        port_w = port_w.max(r.ports.chars().count());
+    }
+    let pid_w = data
+        .iter()
+        .map(|r| r.pid.len())
+        .max()
+        .unwrap_or(3)
+        .max("PID".len());
+    let status_w = "running".len();
+    // Everything left of COMMAND (single-space separated, two after PID).
+    let head = label_w + 1 + pid_w + 2 + status_w + 1 + age_w + 1 + port_w + 1;
+
+    for r in &mut data {
+        // verbose rows end in "  -> <log>"; reserve its width when cutting.
+        let suffix = if verbose {
+            4 + r.log.chars().count()
+        } else {
+            0
         };
-        let detail = format!("{} -> {}", e.cmd, e.log.display());
-        println!(
-            "{:<16} {:>7}  {:<9} {:<19} {}",
-            e.label, e.pid, status, e.started, detail
+        if let Some(w) = width {
+            let budget = w.saturating_sub(head).saturating_sub(suffix);
+            if budget >= CMD_MIN {
+                r.cmd = truncate(&r.cmd, budget);
+            }
+            // Narrower than that: print the command whole, one wrapped line.
+        }
+    }
+
+    let age_header = if verbose { "STARTED" } else { "AGE" };
+    let cmd_header = if verbose { "COMMAND -> LOG" } else { "COMMAND" };
+    println!(
+        "{:<label_w$} {:>pid_w$}  {:<status_w$} {:>age_w$} {:>port_w$} {cmd_header}",
+        "LABEL", "PID", "STATUS", age_header, "PORT",
+    );
+    for r in &data {
+        // Pad the status by its visible width: color codes add bytes, and
+        // Rust's width filler would count them.
+        let status = if color {
+            colorize_status(r.status)
+        } else {
+            r.status.to_string()
+        };
+        let status = format!("{status}{}", " ".repeat(status_w - r.status.len()));
+        let line = format!(
+            "{:<label_w$} {:>pid_w$}  {status} {:>age_w$} {:>port_w$} {}",
+            r.label, r.pid, r.age, r.ports, r.cmd,
         );
+        if verbose {
+            println!("{line}  -> {}", r.log);
+        } else {
+            println!("{line}");
+        }
     }
     0
+}
+
+/// Cut `s` to `max` display chars, marking the cut with an ellipsis.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Ports named on the recorded command line (`--port 4322`, `--port=4322`,
+/// `-p 4322`, `-p4322`, `PORT=4322`), first-seen order, deduplicated. Pure
+/// string parsing — no kernel probing — and it covers the dev-server case
+/// deemo exists for; the `python -m http.server 8000` style (pure positional)
+/// honestly reports none rather than guessing.
+fn ports_in(cmd: &str) -> Vec<String> {
+    let mut ports: Vec<String> = Vec::new();
+    let mut tokens = cmd.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        let port = if tok == "--port" || tok == "-p" {
+            tokens.next().and_then(|t| t.parse::<u16>().ok())
+        } else if let Some(v) = tok.strip_prefix("--port=") {
+            v.parse::<u16>().ok()
+        } else if let Some(v) = tok.strip_prefix("-p") {
+            // -p4322 (an attached non-number like -path just fails to parse)
+            v.parse::<u16>().ok()
+        } else if let Some(v) = tok.strip_prefix("PORT=") {
+            v.parse::<u16>().ok()
+        } else {
+            None
+        };
+        if let Some(p) = port {
+            if p > 0 {
+                let s = p.to_string();
+                if !ports.contains(&s) {
+                    ports.push(s);
+                }
+            }
+        }
+    }
+    ports
+}
+
+/// Age of a `started` stamp (local ISO, as `register` writes it). `None`
+/// when the stamp is unparsable or (clock skew) in the future.
+fn age_of(started: &str) -> Option<std::time::Duration> {
+    let naive = chrono::NaiveDateTime::parse_from_str(started, "%Y-%m-%dT%H:%M:%S").ok()?;
+    let then = naive.and_local_timezone(chrono::Local).latest()?;
+    chrono::Local::now()
+        .signed_duration_since(then)
+        .to_std()
+        .ok()
+}
+
+/// "45s" / "12m" / "5h" / "3d" / "2w" — the coarsest unit that fits.
+fn format_age(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3_600)
+    } else if secs < 7 * 86_400 {
+        format!("{}d", secs / 86_400)
+    } else {
+        format!("{}w", secs / (7 * 86_400))
+    }
+}
+
+/// Width cap for ps output. `COLUMNS` wins — it travels into pipes, where
+/// the tty is gone and ioctl cannot help; then the tty itself; piped with no
+/// `COLUMNS` means no cap (a file consumer handles long lines itself).
+fn output_width() -> Option<usize> {
+    if let Some(n) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return Some(n.max(40));
+    }
+    #[cfg(unix)]
+    {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
+        if ok && ws.ws_col > 0 {
+            return Some(ws.ws_col as usize);
+        }
+    }
+    if std::io::stdout().is_terminal() {
+        Some(80)
+    } else {
+        None
+    }
+}
+
+/// Status color for a tty table: green running, red dead, yellow unknown.
+fn colorize_status(status: &str) -> String {
+    let code = match status {
+        "running" => "\x1b[32m",
+        "dead" => "\x1b[31m",
+        _ => "\x1b[33m",
+    };
+    format!("{code}{status}\x1b[0m")
 }
 
 /// `deemo kill <PORT>...` — stop whatever is bound to the port(s).
@@ -565,4 +769,62 @@ pub fn kill(home: &Path, ports: &[u16], signal: Option<&str>, dry_run: bool) -> 
     // drop the registration of everything that just died, like ps/stop do.
     sweep_dead(home);
     i32::from(failed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_marks_the_cut() {
+        assert_eq!(truncate("short", 8), "short");
+        assert_eq!(truncate("exactly-8!", 10), "exactly-8!");
+        assert_eq!(truncate("0123456789", 8), "0123456…");
+        assert_eq!(truncate("日本語のラベル名", 5), "日本語の…");
+    }
+
+    #[test]
+    fn ports_in_finds_the_flag_forms() {
+        assert_eq!(ports_in("pnpm dev --port 3010"), ["3010"]);
+        assert_eq!(
+            ports_in("astro preview --host 127.0.0.1 --port=4322"),
+            ["4322"]
+        );
+        assert_eq!(ports_in("serve -p 8080"), ["8080"]);
+        assert_eq!(ports_in("serve -p8080"), ["8080"]);
+        assert_eq!(ports_in("PORT=9000 node server.mjs"), ["9000"]);
+        assert_eq!(
+            ports_in("pnpm --filter admin dev --port 8181 --strictPort"),
+            ["8181"]
+        );
+    }
+
+    #[test]
+    fn ports_in_skips_garbage_and_dedupes() {
+        assert!(ports_in("node server/server.mjs").is_empty());
+        assert!(ports_in("cmd --port nope").is_empty());
+        assert!(ports_in("cmd --port 0").is_empty());
+        assert!(ports_in("cmd --port 70000").is_empty());
+        assert!(ports_in("cmd -path/to/x --port").is_empty());
+        assert_eq!(ports_in("x --port 3000 -p 3000 --port=3000"), ["3000"]);
+        assert_eq!(ports_in("x --port 3000 --port 4322"), ["3000", "4322"]);
+    }
+
+    #[test]
+    fn age_uses_the_coarsest_unit() {
+        let a = |s| format_age(std::time::Duration::from_secs(s));
+        assert_eq!(a(45), "45s");
+        assert_eq!(a(60 * 12), "12m");
+        assert_eq!(a(3_600 * 5), "5h");
+        assert_eq!(a(86_400 * 3), "3d");
+        assert_eq!(a(86_400 * 7 * 2), "2w");
+    }
+
+    #[test]
+    fn age_of_parses_the_registered_stamp() {
+        // The registration format register() writes.
+        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        assert!(age_of(&now).unwrap() < std::time::Duration::from_secs(5));
+        assert!(age_of("not-a-time").is_none());
+    }
 }

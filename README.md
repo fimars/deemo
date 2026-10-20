@@ -31,7 +31,8 @@ deemo --foreground -- <CMD>    # stay attached; $? is the child's exit code
 <cmd> | deemo                  # pipe filter; stdout only (add 2>&1 for stderr)
 <cmd> | deemo --background     # detach the pipe pump (unix)
 
-deemo ps                       # label, pid, status, log
+deemo ps                       # label, pid, status, age, port, command
+deemo ps -v                    # + absolute start time and the log path
 deemo stop <LABEL>             # stop it (and every process under that label)
 deemo stop 66089               # one pid instead of a label
 deemo logs <LABEL>             # newest log: path + last ~4 KiB
