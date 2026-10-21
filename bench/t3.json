@@ -1,0 +1,153 @@
+{
+  "label": "t3",
+  "commit": "d593cdf",
+  "host": "Apple M4; 27.0.1",
+  "date": "2026-10-21T15:32:29+0800",
+  "binary": "/Users/fimars/devl1/@fimars/deemo/target/release/deemo",
+  "checks": [
+    {
+      "name": "pipe.byte_exact",
+      "ok": true,
+      "detail": "14200000 bytes through and logged"
+    },
+    {
+      "name": "pipe.unterminated_tail",
+      "ok": true,
+      "detail": "final line without newline kept verbatim"
+    },
+    {
+      "name": "pipe.yolo",
+      "ok": true,
+      "detail": "no log, no registration, byte-exact"
+    },
+    {
+      "name": "fg.byte_exact",
+      "ok": true,
+      "detail": "stdout and stderr merged, 15 MB through and logged"
+    },
+    {
+      "name": "fg.quiet",
+      "ok": true,
+      "detail": "log only, no echo"
+    },
+    {
+      "name": "pipe.head_exit0",
+      "ok": true,
+      "detail": "downstream EPIPE: exit 0, one line, silent"
+    },
+    {
+      "name": "fg.realtime",
+      "ok": true,
+      "detail": "line visible after one read, before the next"
+    },
+    {
+      "name": "pipe.realtime",
+      "ok": true,
+      "detail": "line visible after one read, before the next"
+    },
+    {
+      "name": "pipe.background",
+      "ok": true,
+      "detail": "detached pump wrote the whole stream"
+    },
+    {
+      "name": "kill.dry_run_vs_lsof",
+      "ok": true,
+      "detail": "tcp4 [3761] + client, udp4 [3762], tcp6 [3763], free port empty"
+    },
+    {
+      "name": "kill.dedupe",
+      "ok": true,
+      "detail": "each pid listed once across several ports"
+    },
+    {
+      "name": "liveness.zombie",
+      "ok": true,
+      "detail": "zombie target declared dead in 9 ms"
+    },
+    {
+      "name": "ps.stop",
+      "ok": true,
+      "detail": "registration listed, stopped, swept"
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "stop.dead",
+      "input": "400 live registrations, absent label, aggregated x20",
+      "agg": 20,
+      "reps": 10,
+      "min": 14.83,
+      "median": 16.32,
+      "p90": 17.04,
+      "max": 19.18,
+      "rate": ""
+    },
+    {
+      "name": "kill.many",
+      "input": "5 held ports, real kill in one invocation",
+      "agg": 1,
+      "reps": 10,
+      "min": 9.67,
+      "median": 10.38,
+      "p90": 11.65,
+      "max": 12.28,
+      "rate": "  2077 \u00b5s/kill"
+    },
+    {
+      "name": "stop.alive",
+      "input": "6 live groups under one label",
+      "agg": 1,
+      "reps": 10,
+      "min": 8.28,
+      "median": 8.76,
+      "p90": 8.96,
+      "max": 9.13,
+      "rate": "  1459 \u00b5s/stop"
+    },
+    {
+      "name": "stop.pid",
+      "input": "6 live pids in one invocation",
+      "agg": 1,
+      "reps": 10,
+      "min": 8.11,
+      "median": 8.46,
+      "p90": 8.53,
+      "max": 8.57,
+      "rate": "  1410 \u00b5s/stop"
+    },
+    {
+      "name": "kill.held.real",
+      "input": "1 python http.server holder, real kill",
+      "agg": 1,
+      "reps": 10,
+      "min": 6.59,
+      "median": 7.13,
+      "p90": 7.41,
+      "max": 7.46,
+      "rate": "   140 kill/s"
+    },
+    {
+      "name": "kill.free",
+      "input": "10 free ports, --dry-run",
+      "agg": 1,
+      "reps": 10,
+      "min": 4.97,
+      "median": 5.5,
+      "p90": 5.9,
+      "max": 5.96,
+      "rate": "   550 \u00b5s/port"
+    },
+    {
+      "name": "kill.held",
+      "input": "1 python http.server holder, --dry-run, aggregated x12",
+      "agg": 12,
+      "reps": 10,
+      "min": 4.89,
+      "median": 5.02,
+      "p90": 5.25,
+      "max": 5.3,
+      "rate": "   199 inv/s"
+    }
+  ]
+}

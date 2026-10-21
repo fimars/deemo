@@ -140,7 +140,9 @@ fn zombie(pid: u32) -> bool {
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn zombie(pid: u32) -> bool {
     let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as i32;
+    let size = std::mem::size_of_val(&info) as i32;
+    // proc_pidinfo returns the bytes filled in on success and 0 on failure —
+    // and "no such process" is not alive either.
     let filled = unsafe {
         libc::proc_pidinfo(
             pid as i32,
@@ -150,7 +152,14 @@ fn zombie(pid: u32) -> bool {
             size,
         )
     };
-    filled == size && info.pbsi_status == libc::SZOMB
+    if filled == size {
+        return info.pbsi_status == libc::SZOMB;
+    }
+    // libproc has no address space to report for a process that exists only
+    // as a zombie, so it answers ESRCH. `kill(pid, 0)` already succeeded, so
+    // the process does exist: it is a corpse. Other errnos (EPERM) mean a
+    // live process this user may not inspect.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(all(
@@ -378,13 +387,19 @@ impl Target {
 #[cfg(unix)]
 fn wait_gone(target: Target, grace: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + grace;
-    while std::time::Instant::now() < deadline {
+    let mut delay = FIRST_POLL;
+    loop {
         if target.gone() {
             return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        // Never sleep past the deadline: the last probe happens at grace.
+        std::thread::sleep(delay.min(deadline - now));
+        delay = (delay * 2).min(MAX_POLL);
     }
-    target.gone()
 }
 
 #[cfg(not(unix))]

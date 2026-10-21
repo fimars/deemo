@@ -14,7 +14,7 @@ The pid file is written only when a log exists. `--yolo` discards output and doe
 
 ## Stop is a process group
 
-Detach's pid is the session and group leader. `deemo stop` sends `SIGTERM` to that group (`killpg`), waits 5 seconds, then `SIGKILL`, and waits 1 second more. The pid file is removed only after the group is gone. A survivor keeps its pid file and `stop` exits 1, so a retry still has a target.
+Detach's pid is the session and group leader. `deemo stop` sends `SIGTERM` to that group (`killpg`), waits 5 seconds, then `SIGKILL`, and waits 1 second more. The pid file is removed only after the group is gone. A survivor keeps its pid file and `stop` exits 1, so a retry still has a target. The wait probes with a delay that starts at 0.5 ms and doubles to 50 ms, so a cooperative server is reported gone in a few milliseconds instead of after a flat poll interval; the 5 s and 1 s windows are untouched.
 
 A label is not unique: `pnpm dev:admin` and `pnpm dev:merchant` both default to `pnpm`, and `stop pnpm` takes both down. That is what a label means — one label, one unit. To stop just one, read its pid off `deemo ps` and pass that: a numeric argument is a pid, never a label. A label that is all digits is therefore reachable only as a pid; rename it via `--label`.
 
@@ -43,7 +43,7 @@ Discovery:
 
 `-s` is POSIX `kill -s`: one signal, no escalation, so `-s HUP` reloads. Names accept an optional `SIG` prefix and any case; numbers accept an optional `-`. Signal `0` is rejected because it is `kill`'s existence probe, not a delivered signal. `--dry-run` prints each pid once, even if it holds several of the given ports.
 
-A zombie counts as dead. It holds no sockets, and signalling it does nothing. Treating `kill(pid, 0) == 0` as alive would report a successful kill as "survived SIGTERM and SIGKILL".
+A zombie counts as dead. It holds no sockets, and signalling it does nothing. Treating `kill(pid, 0) == 0` as alive would report a successful kill as "survived SIGTERM and SIGKILL". On macOS libproc answers `ESRCH` for a zombie — there is no address space left to report — so a failed probe of a process that `kill(pid, 0)` still sees is a corpse.
 
 After a kill, registrations whose pids are gone are swept, so `ps` does not keep a corpse.
 
