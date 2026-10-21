@@ -1,0 +1,126 @@
+{
+  "label": "t2",
+  "commit": "8324500",
+  "host": "Apple M4; 27.0.1",
+  "date": "2026-10-21T15:26:21+0800",
+  "binary": "/Users/fimars/devl1/@fimars/deemo/target/release/deemo",
+  "checks": [
+    {
+      "name": "pipe.byte_exact",
+      "ok": true,
+      "detail": "14200000 bytes through and logged"
+    },
+    {
+      "name": "pipe.unterminated_tail",
+      "ok": true,
+      "detail": "final line without newline kept verbatim"
+    },
+    {
+      "name": "pipe.yolo",
+      "ok": true,
+      "detail": "no log, no registration, byte-exact"
+    },
+    {
+      "name": "fg.byte_exact",
+      "ok": true,
+      "detail": "stdout and stderr merged, 15 MB through and logged"
+    },
+    {
+      "name": "fg.quiet",
+      "ok": true,
+      "detail": "log only, no echo"
+    },
+    {
+      "name": "pipe.head_exit0",
+      "ok": true,
+      "detail": "downstream EPIPE: exit 0, one line, silent"
+    },
+    {
+      "name": "log.realtime",
+      "ok": true,
+      "detail": "line visible after one read, before the next"
+    },
+    {
+      "name": "pipe.background",
+      "ok": true,
+      "detail": "detached pump wrote the whole stream"
+    },
+    {
+      "name": "kill.dry_run_vs_lsof",
+      "ok": true,
+      "detail": "tcp4 [94040] + client, udp4 [94041], tcp6 [94042], free port empty"
+    },
+    {
+      "name": "kill.dedupe",
+      "ok": true,
+      "detail": "each pid listed once across several ports"
+    },
+    {
+      "name": "liveness.zombie",
+      "ok": false,
+      "detail": "kill took 6052 ms on a zombie target"
+    },
+    {
+      "name": "ps.stop",
+      "ok": true,
+      "detail": "registration listed, stopped, swept"
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "kill.many",
+      "input": "5 held ports, real kill in one invocation",
+      "agg": 1,
+      "reps": 10,
+      "min": 271.53,
+      "median": 276.25,
+      "p90": 281.87,
+      "max": 285.42,
+      "rate": " 55250 \u00b5s/kill"
+    },
+    {
+      "name": "kill.held.real",
+      "input": "1 python http.server holder, real kill",
+      "agg": 1,
+      "reps": 10,
+      "min": 59.17,
+      "median": 61.71,
+      "p90": 63.41,
+      "max": 109.8,
+      "rate": "    16 kill/s"
+    },
+    {
+      "name": "ref.lsof",
+      "input": "lsof -nP -F pn -i :PORT, free port, aggregated x12",
+      "agg": 12,
+      "reps": 10,
+      "min": 25.95,
+      "median": 26.91,
+      "p90": 27.4,
+      "max": 29.54,
+      "rate": "    37 inv/s"
+    },
+    {
+      "name": "kill.free",
+      "input": "10 free ports, --dry-run",
+      "agg": 1,
+      "reps": 10,
+      "min": 14.86,
+      "median": 15.09,
+      "p90": 15.28,
+      "max": 15.44,
+      "rate": "  1509 \u00b5s/port"
+    },
+    {
+      "name": "kill.held",
+      "input": "1 python http.server holder, --dry-run, aggregated x12",
+      "agg": 12,
+      "reps": 10,
+      "min": 5.53,
+      "median": 5.92,
+      "p90": 7.07,
+      "max": 7.42,
+      "rate": "   169 inv/s"
+    }
+  ]
+}

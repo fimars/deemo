@@ -37,7 +37,8 @@ Without root, other users' sockets are invisible. Same limit as `lsof` and `fuse
 Discovery:
 
 - Linux reads `/proc/net/{tcp,tcp6,udp,udp6}` and matches socket inodes under `/proc/<pid>/fd`. No external tool.
-- macOS and other BSDs run `lsof -nP -F pn`. Field output, not the table: process names with spaces shift columns.
+- macOS walks the process table in-process through libproc: `proc_listallpids`, then `PROC_PIDLISTFDS` and `PROC_PIDFDSOCKETINFO` per process. The `lsof` exec that answers the same question costs ~25 ms, more than the lookup itself; the walk is ~1–4 ms. If that walk cannot read the process table, or no socket fd has a layout deemo recognizes, it falls back to `lsof -nP -F pn` rather than report a busy port as free.
+- Other BSDs run `lsof -nP -F pn`. Field output, not the table: process names with spaces shift columns.
 - Windows runs `netstat -ano`. The pid is the last column, because UDP rows have no state column.
 
 `-s` is POSIX `kill -s`: one signal, no escalation, so `-s HUP` reloads. Names accept an optional `SIG` prefix and any case; numbers accept an optional `-`. Signal `0` is rejected because it is `kill`'s existence probe, not a delivered signal. `--dry-run` prints each pid once, even if it holds several of the given ports.

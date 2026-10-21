@@ -241,6 +241,11 @@ def registry_fixture(ctx: Ctx, live: int, dead: int) -> None:
 
 
 def free_ports(n: int) -> list[int]:
+    """Ports nobody holds on any protocol or address.
+
+    A port can be free for TCP/127.0.0.1 and still be held by a UDP or
+    wildcard socket, which `kill` would legitimately report; lsof is the
+    independent oracle for "free"."""
     ports: list[int] = []
     while len(ports) < n:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -249,20 +254,26 @@ def free_ports(n: int) -> list[int]:
             port = s.getsockname()[1]
         finally:
             s.close()
-        if port >= 1024 and port not in ports:
+        if port < 1024 or port in ports:
+            continue
+        held = subprocess.run(
+            ["lsof", "-nP", "-F", "pn", "-i", f":{port}"],
+            stdout=PIPE, stderr=DEVNULL,
+        ).stdout
+        if not held.strip():
             ports.append(port)
     return ports
 
 
-def wait_port(port: int, deadline: float = 15.0) -> None:
+def wait_port(port: int, host: str = "127.0.0.1", deadline: float = 15.0) -> None:
     end = time.time() + deadline
     while time.time() < end:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            with socket.create_connection((host, port), timeout=0.2):
                 return
         except OSError:
             time.sleep(0.01)
-    raise BenchError(f"holder on port {port} never came up")
+    raise BenchError(f"holder on {host}:{port} never came up")
 
 
 def start_holder(ctx: Ctx, port: int):
@@ -858,35 +869,80 @@ def verify(bin_path: Path) -> list[dict]:
             return "detached pump wrote the whole stream"
 
         def kill_dry_run_matches_lsof():
-            port = free_ports(1)[0]
-            holder = start_holder(ctx, port)
+            # DESIGN Kill: only the *binding* side is a target. Compare with
+            # lsof across TCP/UDP and IPv4/IPv6, with a client connected, and
+            # agree that a free port has no holder.
+            tcp4, udp4, tcp6 = free_ports(3)
+            docroot = str(ctx.root)
+            ready = lambda name: str(ctx.root / f"ready-{name}")
+
+            def binder(port, host, kind, name):
+                # A marker after bind() is the only readiness signal that does
+                # not depend on the thing under test.
+                code = (
+                    "import socket,time\n"
+                    f"s=socket.socket({'socket.AF_INET6' if host == '::1' else 'socket.AF_INET'}, "
+                    f"{'socket.SOCK_DGRAM' if kind == 'udp' else 'socket.SOCK_STREAM'})\n"
+                    f"s.bind(({host!r},{port}))\n"
+                    + ("s.listen()\n" if kind == "tcp" else "")
+                    + f"open({ready(name)!r},'w').close()\n"
+                    "time.sleep(60)\n"
+                )
+                return ctx.spawn([sys.executable, "-c", code], stdout=DEVNULL,
+                                 stderr=DEVNULL)
+
+            holders = {
+                tcp4: ctx.spawn(
+                    [sys.executable, "-m", "http.server", str(tcp4), "--bind",
+                     "127.0.0.1", "--directory", docroot],
+                    stdout=DEVNULL, stderr=DEVNULL,
+                ),
+                udp4: binder(udp4, "127.0.0.1", "udp", "udp4"),
+                tcp6: binder(tcp6, "::1", "tcp", "tcp6"),
+            }
+            wait_port(tcp4)
+            for name in ("udp4", "tcp6"):
+                marker = ctx.root / f"ready-{name}"
+                end = time.time() + 15
+                while not marker.exists():
+                    assert time.time() < end, f"{name} holder never bound"
+                    time.sleep(0.01)
+            client = socket.create_connection(("127.0.0.1", tcp4), timeout=2)
             try:
-                # A connected client must not be reported: only the binder.
-                client = socket.create_connection(("127.0.0.1", port), timeout=2)
-                try:
+                want = {}
+                for port in holders:
                     _, p = timed_deemo(ctx, ["kill", port, "--dry-run"])
-                    mine = sorted(int(x) for x in p.stdout.split())
-                    lsof = subprocess.run(
+                    want[port] = sorted(int(x) for x in p.stdout.split())
+                # lsof as the oracle, filtered to the local side exactly as
+                # deemo documents it.
+                for port, holder in holders.items():
+                    text = subprocess.run(
                         ["lsof", "-nP", "-F", "pn", "-i", f":{port}"],
                         stdout=PIPE, stderr=DEVNULL,
                     ).stdout.decode()
-                    want, pid = set(), None
-                    for line in lsof.splitlines():
+                    oracle, pid = set(), None
+                    for line in text.splitlines():
                         if line.startswith("p"):
                             pid = int(line[1:])
                         elif line.startswith("n") and pid:
                             local = line[1:].split("->")[0]
                             if local.rsplit(":", 1)[-1] == str(port):
-                                want.add(pid)
-                    assert mine == sorted(want), \
-                        f"deemo says {mine}, lsof says {sorted(want)}"
-                    assert holder.pid in mine, "the holder itself is missing"
-                finally:
-                    client.close()
+                                oracle.add(pid)
+                    assert want[port] == sorted(oracle), \
+                        f"port {port}: deemo {want[port]}, lsof {sorted(oracle)}"
+                    assert holder.pid in want[port], f"port {port}: holder missing"
+                # A port nobody holds: both say so.
+                free = free_ports(1)[0]
+                _, p = timed_deemo(ctx, ["kill", free, "--dry-run"], expect=(0, 1))
+                assert p.stdout.split() == [], p.stdout
+                assert b"nothing is using port" in p.stderr, p.stderr
+                return (f"tcp4 {want[tcp4]} + client, udp4 {want[udp4]}, "
+                        f"tcp6 {want[tcp6]}, free port empty")
             finally:
-                holder.kill()
-                wait_exit([holder])
-            return f"deemo == lsof ({mine}) with a client connected"
+                client.close()
+                for h in holders.values():
+                    h.kill()
+                wait_exit(list(holders.values()))
 
         def kill_dedupe():
             ports = free_ports(2)
