@@ -818,7 +818,9 @@ pub fn kill(home: &Path, ports: &[u16], signal: Option<&str>, dry_run: bool) -> 
     // Housekeeping: a pid we stopped may have been deemo-managed — drop that
     // one registration, but only if the process is really gone (a survivor or
     // a `-s HUP` reload keeps its file). Sweeping the whole registry here
-    // would re-read every entry after every kill.
+    // would re-read every entry after every kill. Windows has no liveness
+    // probe, so it never swept here in the first place.
+    #[cfg(unix)]
     if !dry_run {
         for &(_, pid) in &plan {
             if let Some(entry) = managed.get(&pid) {
