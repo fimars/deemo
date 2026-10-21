@@ -45,7 +45,7 @@ Discovery:
 
 A zombie counts as dead. It holds no sockets, and signalling it does nothing. Treating `kill(pid, 0) == 0` as alive would report a successful kill as "survived SIGTERM and SIGKILL". On macOS libproc answers `ESRCH` for a zombie — there is no address space left to report — so a failed probe of a process that `kill(pid, 0)` still sees is a corpse.
 
-After a kill, registrations whose pids are gone are swept, so `ps` does not keep a corpse.
+After a kill, the registration of each pid it stopped is removed once that process is gone — a survivor, or one merely sent `-s HUP`, keeps its file, and `--dry-run` removes nothing. `ps` and `stop` sweep every dead registration they find.
 
 ## Pipe
 

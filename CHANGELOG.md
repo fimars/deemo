@@ -8,23 +8,25 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Every command is faster, measured by `scripts/bench.py` against a release
-  build (200k lines / 13.5 MB, Apple M4). Piping through deemo: 427 → 19 ms
-  (`--quiet` 305 → 20, `--yolo` 100 → 18); `--foreground`: 435 → 28 ms. The
-  pump moves 64 KiB slabs instead of paying three syscalls per line, and
-  flushes before the read that could block, so a paused writer still sees its
-  line immediately. Foreground still merges whole lines.
+- Every command is faster, measured by `scripts/bench.py` (200k lines /
+  13.5 MB, release build, Apple M4, both binaries measured interleaved).
+  Piping through deemo: 519 → 11 ms (`--quiet` 382 → 12, `--yolo` 167 → 9);
+  `--foreground`: 552 → 35 ms. The pump moves 64 KiB slabs instead of paying
+  three syscalls per line, and flushes before the read that could block, so a
+  paused writer still sees its line immediately. Foreground still merges
+  whole lines.
 - `kill <PORT>` answers from the process table instead of an `lsof` exec on
   macOS, and one scan covers every port in the argument list: a 10-port
-  `--dry-run` is 264 → 7 ms. `lsof` stays as the fallback if the table cannot
+  `--dry-run` is 283 → 7 ms. `lsof` stays as the fallback if the table cannot
   be read.
 - `stop` and `kill` see a cooperative exit in ~1.5 ms instead of ~55 ms: the
   escalation poll starts at 0.5 ms and doubles to the old 50 ms. The 5 s and
   1 s windows are unchanged.
 - `ps` and `stop` read the registry once instead of twice, `ps` reads the
-  clock once per table and writes the table in one write: 4000 registrations
-  78 → 33 ms (16 → 8 µs per entry), `stop` with an absent label over 400
-  registrations 15 → 10 ms.
+  clock once per table and writes the table in one write: 2000 registrations
+  62 → 34 ms (17 µs per entry; 200 → 7), a registry holding 200 corpses
+  20 → 17 ms, and `stop` with an absent label over 400 registrations
+  18 → 12 ms.
 - `ps` is readable again. The table now sizes its columns to the
   content (a label longer than the old hard-coded 16 chars collapsed
   every column after it), shows the age relative to now (`3d`, `5h`)

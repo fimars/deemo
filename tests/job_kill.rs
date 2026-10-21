@@ -124,7 +124,7 @@ fn have_python3() -> bool {
 
 /// README: kill frees the port AND housekeeping keeps `ps` truthful — a
 /// deemo-started holder goes down as a group (detach gave it a private
-/// session) and its registration is swept with it.
+/// session) and the registration of that pid is removed with it.
 #[cfg(unix)]
 #[test]
 fn kill_frees_the_port_and_sweeps_the_managed_pid_file() {

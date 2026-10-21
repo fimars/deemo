@@ -168,9 +168,9 @@ fn detach_writes_a_readable_registration_record() {
     wait_for_log(home.path(), "rec-", |c| c.contains("reg-ok"));
 }
 
-/// DESIGN: "After a kill, registrations whose pids are gone are swept, so ps
-/// does not keep a corpse" — a stale pid file (crashed child) is housekept,
-/// and ps reports the empty truth with exit 1.
+/// DESIGN: "`ps` and `stop` sweep every dead registration they find" — a stale
+/// pid file (crashed child) is housekept, and ps reports the empty truth with
+/// exit 1.
 #[test]
 fn ps_sweeps_registrations_whose_process_is_gone() {
     let home = Home::new();
