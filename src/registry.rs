@@ -141,8 +141,6 @@ fn zombie(pid: u32) -> bool {
 fn zombie(pid: u32) -> bool {
     let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as i32;
-    // proc_pidinfo returns the bytes filled in on success and 0 on failure —
-    // and "no such process" is not alive either.
     let filled = unsafe {
         libc::proc_pidinfo(
             pid as i32,
@@ -207,10 +205,19 @@ enum StopOutcome {
     Stubborn,
 }
 
-#[cfg(unix)] // the SIGTERM→SIGKILL escalation that waits them out
+#[cfg(unix)]
 const TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(unix)]
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// First probe delay while waiting for a signalled process to disappear. A
+/// cooperative server is gone in ~2 ms, so starting at 50 ms would make every
+/// `stop` look like it ignored the signal; the delay doubles up to the old
+/// cadence, which is what a target that ignores SIGTERM still sees.
+#[cfg(unix)]
+const FIRST_POLL: std::time::Duration = std::time::Duration::from_micros(500);
+#[cfg(unix)]
+const MAX_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// One `deemo stop` argument. A number is a pid, anything else a label.
 enum Selector {
@@ -694,20 +701,27 @@ pub fn kill(home: &Path, ports: &[u16], signal: Option<&str>, dry_run: bool) -> 
     let mut plan: Vec<(u16, u32)> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
 
-    for &port in ports {
-        match crate::port::holders(port) {
-            Ok(pids) if pids.is_empty() => empty.push(port),
-            Ok(pids) => {
+    match crate::port::holders(ports) {
+        Ok(found) => {
+            for (&port, pids) in ports.iter().zip(found) {
+                if pids.is_empty() {
+                    empty.push(port);
+                    continue;
+                }
                 for pid in pids {
                     if seen.insert(pid) {
                         plan.push((port, pid));
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("deemo: cannot list the processes on port {port}: {e}");
-                failed = true;
-            }
+        }
+        Err(e) => {
+            let list: Vec<String> = ports.iter().map(u16::to_string).collect();
+            eprintln!(
+                "deemo: cannot list the processes on port {}: {e}",
+                list.join(", ")
+            );
+            failed = true;
         }
     }
 

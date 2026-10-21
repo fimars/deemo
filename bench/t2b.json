@@ -1,0 +1,65 @@
+{
+  "label": "t2b",
+  "commit": "ca59d6e",
+  "host": "Apple M4; 27.0.1",
+  "date": "2026-10-21T15:31:28+0800",
+  "binary": "/Users/fimars/devl1/@fimars/deemo/target/release/deemo",
+  "checks": [],
+  "scenarios": [
+    {
+      "name": "kill.many",
+      "input": "5 held ports, real kill in one invocation",
+      "agg": 1,
+      "reps": 10,
+      "min": 269.2,
+      "median": 273.38,
+      "p90": 279.18,
+      "max": 279.39,
+      "rate": " 54677 \u00b5s/kill"
+    },
+    {
+      "name": "kill.held.real",
+      "input": "1 python http.server holder, real kill",
+      "agg": 1,
+      "reps": 10,
+      "min": 57.35,
+      "median": 61.21,
+      "p90": 64.61,
+      "max": 66.4,
+      "rate": "    16 kill/s"
+    },
+    {
+      "name": "ref.lsof",
+      "input": "lsof -nP -F pn -i :PORT, free port, aggregated x12",
+      "agg": 12,
+      "reps": 10,
+      "min": 26.12,
+      "median": 26.69,
+      "p90": 29.33,
+      "max": 30.62,
+      "rate": "    37 inv/s"
+    },
+    {
+      "name": "kill.free",
+      "input": "10 free ports, --dry-run",
+      "agg": 1,
+      "reps": 10,
+      "min": 6.23,
+      "median": 7.67,
+      "p90": 10.18,
+      "max": 12.23,
+      "rate": "   767 \u00b5s/port"
+    },
+    {
+      "name": "kill.held",
+      "input": "1 python http.server holder, --dry-run, aggregated x12",
+      "agg": 12,
+      "reps": 10,
+      "min": 5.76,
+      "median": 6.42,
+      "p90": 7.52,
+      "max": 7.52,
+      "rate": "   156 inv/s"
+    }
+  ]
+}
