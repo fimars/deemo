@@ -79,10 +79,25 @@ impl Sink {
     }
 }
 
-/// A file deemo would have written for `label` (`<label>.log` or `<label>-*.log`).
-fn belongs_to(name: &str, label: &str) -> bool {
-    name == format!("{label}.log")
-        || (name.starts_with(&format!("{label}-")) && name.ends_with(".log"))
+/// A file deemo would have written for `label` (`<label>.log` or
+/// `<label>-*.log`). Built once per directory scan: the label does not change,
+/// so neither needle should be rebuilt per entry.
+struct LogName {
+    exact: String,
+    prefix: String,
+}
+
+impl LogName {
+    fn of(label: &str) -> LogName {
+        LogName {
+            exact: format!("{label}.log"),
+            prefix: format!("{label}-"),
+        }
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        name == self.exact || (name.starts_with(&self.prefix) && name.ends_with(".log"))
+    }
 }
 
 /// Delete the oldest log files of the same label, keeping at most `keep`
@@ -94,6 +109,7 @@ pub fn prune_old_logs(home: &Path, label: &str, keep: u32, current: &Path) -> Re
         return Ok(0);
     }
     let logs_dir = home.join("logs");
+    let ours = LogName::of(label);
 
     let mut files: Vec<PathBuf> = fs::read_dir(&logs_dir)
         .with_context(|| format!("failed to read log directory {}", logs_dir.display()))?
@@ -101,7 +117,7 @@ pub fn prune_old_logs(home: &Path, label: &str, keep: u32, current: &Path) -> Re
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|name| belongs_to(name, label))
+                .is_some_and(|name| ours.matches(name))
         })
         .collect();
     files.sort();
@@ -122,13 +138,14 @@ pub fn prune_old_logs(home: &Path, label: &str, keep: u32, current: &Path) -> Re
 /// Newest log for a label. Names embed the timestamp, so the greatest name is
 /// the newest run. `--timestamp off` is the single `<label>.log` file.
 fn latest_log(home: &Path, label: &str) -> Option<PathBuf> {
+    let ours = LogName::of(label);
     let mut best: Option<PathBuf> = None;
     let entries = fs::read_dir(home.join("logs")).ok()?;
     for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !belongs_to(name, label) {
+        if !ours.matches(name) {
             continue;
         }
         let newer = best

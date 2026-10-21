@@ -9,6 +9,7 @@
 //! user's shell — and deemo's own pids as a group.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -262,9 +263,8 @@ impl Selector {
 /// registration under it, a pid stops exactly one. Returns an exit code.
 pub fn stop(home: &Path, targets: &[String]) -> i32 {
     // Dead registrations must not linger (nor show up as "is not running"):
-    // sweep them before matching, like `ps` does.
-    sweep_dead(home);
-    let entries = list(home);
+    // sweep them before matching, like `ps` does — in the same pass.
+    let entries = sweep_dead(home);
     let mut failed = false;
     // `deemo stop pnpm 66089` selects one entry twice: stop it once.
     let mut handled: HashSet<u32> = HashSet::new();
@@ -444,15 +444,22 @@ fn stop_method(_group: bool) -> &'static str {
     "taskkill /F /T"
 }
 
-/// Remove pid-files whose processes are **known** to be dead (housekeeping
-/// for ps). `Unknown` registrations are kept — sweeping them would erase the
-/// registry on platforms without a liveness probe.
-fn sweep_dead(home: &Path) {
-    for (entry, liveness) in list(home) {
-        if liveness == Liveness::Dead {
-            let _ = fs::remove_file(entry.file);
+/// All registrations, with the dead ones deleted on the way out. One
+/// directory read and one liveness probe per entry: at a few thousand
+/// registrations that read is the whole cost of a management command, so
+/// "sweep, then list" must never be two passes. `Unknown` registrations are
+/// kept — sweeping them would erase the registry on platforms without a
+/// liveness probe.
+fn sweep_dead(home: &Path) -> Vec<(Entry, Liveness)> {
+    let mut entries = list(home);
+    entries.retain(|(entry, liveness)| {
+        if *liveness == Liveness::Dead {
+            let _ = fs::remove_file(&entry.file);
+            return false;
         }
-    }
+        true
+    });
+    entries
 }
 
 /// Cap for the label column: a label is the row's key (you `stop` by it), so
@@ -464,8 +471,7 @@ const CMD_MIN: usize = 16;
 
 /// `deemo ps` — human table. Exit code 1 when nothing is running.
 pub fn ps(home: &Path, verbose: bool) -> i32 {
-    sweep_dead(home);
-    let rows = list(home);
+    let rows = sweep_dead(home);
     if rows.is_empty() {
         println!("no processes started by deemo");
         return 1;
@@ -484,6 +490,9 @@ pub fn ps(home: &Path, verbose: bool) -> i32 {
         log: String,   // verbose only
     }
 
+    // One clock read for the whole table: the age column is relative to "now",
+    // and resolving the local timezone once per row costs more than the row.
+    let now = chrono::Local::now().naive_local();
     let mut data: Vec<Row> = rows
         .iter()
         .map(|(e, liveness)| {
@@ -495,7 +504,7 @@ pub fn ps(home: &Path, verbose: bool) -> i32 {
             let age = if verbose {
                 e.started.clone()
             } else {
-                age_of(&e.started).map_or_else(|| "?".to_string(), format_age)
+                age_of(&e.started, now).map_or_else(|| "?".to_string(), format_age)
             };
             let found = ports_in(&e.cmd);
             Row {
@@ -509,7 +518,11 @@ pub fn ps(home: &Path, verbose: bool) -> i32 {
                     found.join(",")
                 },
                 cmd: e.cmd.clone(),
-                log: e.log.display().to_string(),
+                log: if verbose {
+                    e.log.display().to_string()
+                } else {
+                    String::new()
+                },
             }
         })
         .collect();
@@ -554,7 +567,11 @@ pub fn ps(home: &Path, verbose: bool) -> i32 {
 
     let age_header = if verbose { "STARTED" } else { "AGE" };
     let cmd_header = if verbose { "COMMAND -> LOG" } else { "COMMAND" };
-    println!(
+    // The whole table into one String: a println! per row is a syscall per
+    // row through a pipe, which at 2000 rows is slower than building the rows.
+    let mut out = String::with_capacity(data.len() * 96);
+    let _ = writeln!(
+        out,
         "{:<label_w$} {:>pid_w$}  {:<status_w$} {:>age_w$} {:>port_w$} {cmd_header}",
         "LABEL", "PID", "STATUS", age_header, "PORT",
     );
@@ -562,30 +579,36 @@ pub fn ps(home: &Path, verbose: bool) -> i32 {
         // Pad the status by its visible width: color codes add bytes, and
         // Rust's width filler would count them.
         let status = if color {
-            colorize_status(r.status)
+            let colored = colorize_status(r.status);
+            format!("{colored}{}", " ".repeat(status_w - r.status.len()))
         } else {
-            r.status.to_string()
+            format!("{:<status_w$}", r.status)
         };
-        let status = format!("{status}{}", " ".repeat(status_w - r.status.len()));
-        let line = format!(
+        let _ = write!(
+            out,
             "{:<label_w$} {:>pid_w$}  {status} {:>age_w$} {:>port_w$} {}",
             r.label, r.pid, r.age, r.ports, r.cmd,
         );
         if verbose {
-            println!("{line}  -> {}", r.log);
-        } else {
-            println!("{line}");
+            let _ = write!(out, "  -> {}", r.log);
         }
+        out.push('\n');
     }
+    print!("{out}");
     0
 }
 
 /// Cut `s` to `max` display chars, marking the cut with an ellipsis.
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    // Bytes bound chars, so the ASCII case needs no character walk at all.
+    if s.len() <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    let mut chars = s.chars();
+    let mut out: String = chars.by_ref().take(max.saturating_sub(1)).collect();
+    if chars.next().is_none() {
+        return s.to_string(); // multibyte but still short enough
+    }
     out.push('…');
     out
 }
@@ -623,15 +646,12 @@ fn ports_in(cmd: &str) -> Vec<String> {
     ports
 }
 
-/// Age of a `started` stamp (local ISO, as `register` writes it). `None`
-/// when the stamp is unparsable or (clock skew) in the future.
-fn age_of(started: &str) -> Option<std::time::Duration> {
-    let naive = chrono::NaiveDateTime::parse_from_str(started, "%Y-%m-%dT%H:%M:%S").ok()?;
-    let then = naive.and_local_timezone(chrono::Local).latest()?;
-    chrono::Local::now()
-        .signed_duration_since(then)
-        .to_std()
-        .ok()
+/// Age of a `started` stamp (local ISO, as `register` writes it) relative to
+/// `now` (the same local clock, read once per table). `None` when the stamp is
+/// unparsable or (clock skew) in the future.
+fn age_of(started: &str, now: chrono::NaiveDateTime) -> Option<std::time::Duration> {
+    let then = chrono::NaiveDateTime::parse_from_str(started, "%Y-%m-%dT%H:%M:%S").ok()?;
+    now.signed_duration_since(then).to_std().ok()
 }
 
 /// "45s" / "12m" / "5h" / "3d" / "2w" — the coarsest unit that fits.
@@ -704,10 +724,11 @@ pub fn kill(home: &Path, ports: &[u16], signal: Option<&str>, dry_run: bool) -> 
     // ran setsid), so their process group is their own — signalling it also
     // takes their launcher tree down, exactly like `stop`. Every other pid
     // is signalled alone: its group may be your shell's.
-    let managed: HashMap<u32, String> = list(home)
-        .into_iter()
-        .filter(|&(_, liveness)| liveness != Liveness::Dead)
-        .map(|(entry, _)| (entry.pid, entry.label))
+    let registrations = list(home);
+    let managed: HashMap<u32, &Entry> = registrations
+        .iter()
+        .filter(|(_, liveness)| *liveness != Liveness::Dead)
+        .map(|(entry, _)| (entry.pid, entry))
         .collect();
 
     let mut failed = false;
@@ -753,7 +774,7 @@ pub fn kill(home: &Path, ports: &[u16], signal: Option<&str>, dry_run: bool) -> 
                 Target::Pid(pid)
             };
             let subject = match managed.get(&pid) {
-                Some(label) => format!("{label} (pid {pid})"),
+                Some(entry) => format!("{} (pid {pid})", entry.label),
                 None => format!("pid {pid}"),
             };
 
@@ -794,9 +815,19 @@ pub fn kill(home: &Path, ports: &[u16], signal: Option<&str>, dry_run: bool) -> 
         failed = true;
     }
 
-    // Housekeeping: a killed pid may have been a deemo-managed process —
-    // drop the registration of everything that just died, like ps/stop do.
-    sweep_dead(home);
+    // Housekeeping: a pid we stopped may have been deemo-managed — drop that
+    // one registration, but only if the process is really gone (a survivor or
+    // a `-s HUP` reload keeps its file). Sweeping the whole registry here
+    // would re-read every entry after every kill.
+    if !dry_run {
+        for &(_, pid) in &plan {
+            if let Some(entry) = managed.get(&pid) {
+                if !alive(pid) {
+                    let _ = fs::remove_file(&entry.file);
+                }
+            }
+        }
+    }
     i32::from(failed)
 }
 
@@ -852,8 +883,9 @@ mod tests {
     #[test]
     fn age_of_parses_the_registered_stamp() {
         // The registration format register() writes.
-        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        assert!(age_of(&now).unwrap() < std::time::Duration::from_secs(5));
-        assert!(age_of("not-a-time").is_none());
+        let now = chrono::Local::now().naive_local();
+        let stamp = now.format("%Y-%m-%dT%H:%M:%S").to_string();
+        assert!(age_of(&stamp, now).unwrap() < std::time::Duration::from_secs(5));
+        assert!(age_of("not-a-time", now).is_none());
     }
 }
