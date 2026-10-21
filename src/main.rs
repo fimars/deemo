@@ -5,7 +5,7 @@ mod signal;
 mod sink;
 
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -21,6 +21,12 @@ const EXIT_OK: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_CMD_NOT_FOUND: i32 = 127;
 const EXIT_INTERRUPTED: i32 = 130; // 128 + SIGINT, the unix convention
+
+/// Read size for the pump, and the cap on how much output may sit in deemo's
+/// buffers. One read becomes one write: a writer that pauses after a line is
+/// seen line by line, a burst is written in slabs instead of a syscall (or
+/// three) per line. 64 KiB is also the largest lag `tail -f` would see.
+const CHUNK: usize = 64 * 1024;
 
 /// Why the pump loop should stop.
 enum Stop {
@@ -132,8 +138,7 @@ fn prepare_log(cli: &Cli, home: &std::path::Path, mode: LogMode) -> Option<sink:
 ///   alive after a short grace period (e.g. someone ran `kill -INT <deemo-pid>`
 ///   targeting deemo alone), SIGINT is forwarded to it. The delay avoids a
 ///   second premature SIGINT cutting the child's graceful shutdown short.
-/// - 2nd press: exit immediately (the log is flushed line by line, so nothing
-///   already written is lost).
+/// - 2nd press: exit immediately, forfeiting at most one buffered slab.
 fn install_ctrlc() {
     ctrlc::set_handler(|| {
         if !INTERRUPTED.swap(true, Ordering::SeqCst) {
@@ -160,34 +165,63 @@ fn install_ctrlc() {
     .unwrap_or_else(|e| eprintln!("deemo: warning: could not install Ctrl+C handler: {e}"));
 }
 
-/// Write one chunk to stdout (unless quiet) and the log file.
-fn emit_line(
+/// Queue bytes for the log and stdout. A log failure only loses logging;
+/// a stdout failure stops the pump (EPIPE being the graceful one).
+fn emit(
     buf: &[u8],
     stdout: &mut io::Stdout,
     quiet: bool,
     sink: &mut Option<sink::Sink>,
 ) -> Result<(), Stop> {
-    if !quiet {
-        if let Err(e) = stdout.write_all(buf).and_then(|()| stdout.flush()) {
-            return if e.kind() == io::ErrorKind::BrokenPipe {
-                Err(Stop::BrokenPipe)
-            } else {
-                eprintln!("deemo: error writing stdout: {e}");
-                Err(Stop::StdoutError)
-            };
-        }
+    write_log(sink, buf);
+    if quiet {
+        return Ok(());
     }
-    let log_broken = match sink.as_mut() {
-        Some(s) => s.write_line(buf).is_err(),
+    stdout.write_all(buf).map_err(stdout_stopped)
+}
+
+/// Push everything queued so far out. Called right before a read that may
+/// block, so a line is visible as soon as the writer pauses.
+fn emit_flush(
+    stdout: &mut io::Stdout,
+    quiet: bool,
+    sink: &mut Option<sink::Sink>,
+) -> Result<(), Stop> {
+    flush_log(sink);
+    if quiet {
+        return Ok(());
+    }
+    stdout.flush().map_err(stdout_stopped)
+}
+
+fn stdout_stopped(e: io::Error) -> Stop {
+    if e.kind() == io::ErrorKind::BrokenPipe {
+        Stop::BrokenPipe
+    } else {
+        eprintln!("deemo: error writing stdout: {e}");
+        Stop::StdoutError
+    }
+}
+
+fn write_log(sink: &mut Option<sink::Sink>, bytes: &[u8]) {
+    log_op(sink, |s| s.write(bytes));
+}
+
+fn flush_log(sink: &mut Option<sink::Sink>) {
+    log_op(sink, |s| s.flush());
+}
+
+fn log_op(sink: &mut Option<sink::Sink>, op: impl FnOnce(&mut sink::Sink) -> std::io::Result<()>) {
+    let broken = match sink.as_mut() {
+        Some(s) => op(s).is_err(),
         None => false,
     };
-    if log_broken {
-        // Degrade to pure passthrough; never kill the user's stream because of
-        // a disk problem. Warn only once.
+    if broken {
+        // Degrade to pure passthrough; never kill the user's stream because
+        // of a disk problem. Warn only once.
         *sink = None;
         eprintln!("deemo: warning: log write failed, continuing without logging");
     }
-    Ok(())
 }
 
 fn report_log(sink: &Option<sink::Sink>) {
@@ -255,40 +289,38 @@ fn pipe_background(_cli: &Cli, _home: &std::path::Path) -> i32 {
 /// and outlives the terminal; losing stdout degrades to log-only instead of
 /// killing the pump.
 fn pump_pipe(cli: &Cli, sink: &mut Option<sink::Sink>, detached: bool) -> i32 {
-    let stdin = io::stdin();
-    let mut reader = io::BufReader::new(stdin.lock());
+    let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout();
-    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut buf = vec![0u8; CHUNK];
     let mut passthrough_dead = false;
 
     loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
+        let filled = match stdin.read(&mut buf) {
             Ok(0) => break, // EOF: every writer of the pipe is gone
-            Ok(_) => {}
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 eprintln!("deemo: error reading stdin: {e}");
                 return EXIT_ERROR;
             }
-        }
+        };
+        let slab = &buf[..filled];
         if passthrough_dead {
             // terminal gone (detached run): keep only writing the log
-            let log_broken = match sink.as_mut() {
-                Some(s) => s.write_line(&buf).is_err(),
-                None => false,
-            };
-            if log_broken {
-                *sink = None;
-            }
+            write_log(sink, slab);
+            flush_log(sink);
             continue;
         }
-        match emit_line(&buf, &mut stdout, cli.quiet, sink) {
+        match emit(slab, &mut stdout, cli.quiet, sink)
+            .and_then(|()| emit_flush(&mut stdout, cli.quiet, sink))
+        {
             Ok(()) => {}
             Err(Stop::BrokenPipe) => {
                 if detached {
                     passthrough_dead = true;
                     eprintln!("deemo: terminal gone; switching to log-only");
                 } else {
+                    flush_log(sink); // keep what was read before the reader left
                     return EXIT_OK; // graceful, like `rg | head`
                 }
             }
@@ -296,6 +328,7 @@ fn pump_pipe(cli: &Cli, sink: &mut Option<sink::Sink>, detached: bool) -> i32 {
                 if detached {
                     passthrough_dead = true;
                 } else {
+                    flush_log(sink);
                     report_log(sink);
                     return EXIT_ERROR;
                 }
@@ -314,7 +347,7 @@ fn pump_pipe(cli: &Cli, sink: &mut Option<sink::Sink>, detached: bool) -> i32 {
 /// Foreground mode: `deemo --foreground -- <CMD>`. Spawn the child, capture
 /// both stdout and stderr (merged, like `2>&1` built in), and exit with the
 /// child's exit code.
-fn supervise(cli: &Cli, mut sink: Option<sink::Sink>) -> i32 {
+fn supervise(cli: &Cli, sink: Option<sink::Sink>) -> i32 {
     let cmd = &cli.command;
     eprintln!("deemo: supervising: {}", cmd.join(" "));
 
@@ -324,7 +357,8 @@ fn supervise(cli: &Cli, mut sink: Option<sink::Sink>) -> i32 {
     };
     let _ = CHILD_PID.set(child.id());
 
-    // One reader thread per captured fd; lines are merged through a channel.
+    // One reader thread per captured fd; whole lines are merged through one
+    // channel, so the other stream can never split a line in the log.
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let streams: Vec<Box<dyn io::Read + Send>> = vec![
         Box::new(child.stdout.take().expect("stdout was piped")),
@@ -333,14 +367,15 @@ fn supervise(cli: &Cli, mut sink: Option<sink::Sink>) -> i32 {
     for stream in streams {
         let tx = tx.clone();
         std::thread::spawn(move || {
-            let mut reader = io::BufReader::new(stream);
-            let mut buf = Vec::with_capacity(8 * 1024);
+            let mut reader = io::BufReader::with_capacity(CHUNK, stream);
             loop {
-                buf.clear();
+                // Hand each line over by value: the pump is the only consumer
+                // and a fresh buffer beats cloning the previous one.
+                let mut buf = Vec::with_capacity(256);
                 match reader.read_until(b'\n', &mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        if tx.send(buf.clone()).is_err() {
+                        if tx.send(buf).is_err() {
                             break; // receiver is gone
                         }
                     }
@@ -350,36 +385,106 @@ fn supervise(cli: &Cli, mut sink: Option<sink::Sink>) -> i32 {
     }
     drop(tx);
 
-    let mut stdout = io::stdout();
-    while let Ok(line) = rx.recv() {
-        match emit_line(&line, &mut stdout, cli.quiet, &mut sink) {
-            Ok(()) => {}
-            // Downstream closed: stop the child with it (it would only die of
-            // EPIPE anyway) and leave quietly — `| head` is not an error.
-            Err(Stop::BrokenPipe) => {
-                let _ = child.kill();
-                return EXIT_OK;
+    let mut out = Out::new(cli.quiet, sink);
+    let stopped = loop {
+        let line = match rx.try_recv() {
+            Ok(line) => line,
+            // Nothing in flight: push the buffer out, then blocking is safe.
+            Err(mpsc::TryRecvError::Empty) => {
+                if let Err(stop) = out.flush() {
+                    break Some(stop);
+                }
+                match rx.recv() {
+                    Ok(line) => line,
+                    Err(_) => break None, // both fds are closed
+                }
             }
+            Err(mpsc::TryRecvError::Disconnected) => break None,
+        };
+        if let Err(stop) = out.write(&line) {
+            break Some(stop);
+        }
+    };
+
+    match stopped {
+        // Downstream closed: stop the child with it (it would only die of
+        // EPIPE anyway) and leave quietly — `| head` is not an error.
+        Some(Stop::BrokenPipe) => {
+            let _ = child.kill();
+            out.flush_log();
+            EXIT_OK
+        }
+        Some(Stop::StdoutError) => {
+            let _ = child.kill();
+            out.flush_log();
+            report_log(&out.sink);
+            EXIT_ERROR
+        }
+        None => match out.flush() {
+            // `| head` is not an error, even when the reader left during the
+            // final flush.
+            Err(Stop::BrokenPipe) => EXIT_OK,
             Err(Stop::StdoutError) => {
-                let _ = child.kill();
-                report_log(&sink);
-                return EXIT_ERROR;
+                report_log(&out.sink);
+                EXIT_ERROR
             }
+            // Both fds are closed: the child exited (or closed its streams).
+            Ok(()) => match child.wait() {
+                Ok(status) => {
+                    eprintln!("deemo: child exited ({status})");
+                    report_log(&out.sink);
+                    status_code(&status)
+                }
+                Err(e) => {
+                    eprintln!("deemo: error waiting for child: {e}");
+                    report_log(&out.sink);
+                    EXIT_ERROR
+                }
+            },
+        },
+    }
+}
+
+/// The foreground pump's output side: stdout and the log, both buffered, so a
+/// burst costs one write per slab instead of one per line. `flush` runs
+/// whenever the line channel runs dry — right before the pump would block.
+struct Out {
+    quiet: bool,
+    stdout: io::BufWriter<io::StdoutLock<'static>>,
+    sink: Option<sink::Sink>,
+}
+
+impl Out {
+    fn new(quiet: bool, sink: Option<sink::Sink>) -> Out {
+        Out {
+            quiet,
+            stdout: io::BufWriter::with_capacity(CHUNK, io::stdout().lock()),
+            sink,
         }
     }
 
-    // Both fds are closed: the child exited (or closed its streams).
-    match child.wait() {
-        Ok(status) => {
-            eprintln!("deemo: child exited ({status})");
-            report_log(&sink);
-            status_code(&status)
+    fn write(&mut self, line: &[u8]) -> Result<(), Stop> {
+        if !self.quiet {
+            if let Err(e) = self.stdout.write_all(line) {
+                return Err(stdout_stopped(e));
+            }
         }
-        Err(e) => {
-            eprintln!("deemo: error waiting for child: {e}");
-            report_log(&sink);
-            EXIT_ERROR
+        write_log(&mut self.sink, line);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), Stop> {
+        // Log first: a closed downstream must not cost the log the bytes that
+        // were already read.
+        self.flush_log();
+        if self.quiet {
+            return Ok(());
         }
+        self.stdout.flush().map_err(stdout_stopped)
+    }
+
+    fn flush_log(&mut self) {
+        flush_log(&mut self.sink);
     }
 }
 

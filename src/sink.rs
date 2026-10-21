@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -20,9 +20,11 @@ pub fn resolve_home(override_dir: Option<&Path>) -> PathBuf {
         .join(".deemo")
 }
 
-/// A log file sink. Holds the open file so the main loop can append lines.
+/// A log file sink. Buffered: the pump decides when the bytes must be on
+/// disk (before it blocks on a read), because a syscall per line costs more
+/// than the line itself.
 pub struct Sink {
-    file: fs::File,
+    file: BufWriter<fs::File>,
     pub path: PathBuf,
 }
 
@@ -52,17 +54,28 @@ impl Sink {
             .open(&path)
             .with_context(|| format!("failed to open log file {}", path.display()))?;
 
-        Ok(Sink { file, path })
+        Ok(Sink {
+            file: BufWriter::new(file),
+            path,
+        })
     }
 
-    /// Append raw bytes (already contains the newline, or an EOF-truncated tail).
-    pub fn write_line(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    /// Append raw bytes (a line, or a whole slab of them).
+    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.file.write_all(bytes)
+    }
+
+    /// Push what [`Sink::write`] queued into the file.
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
     }
 
     /// Hand the open file to a detached child. The path stays for the pid file.
     pub fn into_file(self) -> (fs::File, PathBuf) {
-        (self.file, self.path)
+        // Detach hands the fd over before writing anything through the sink,
+        // so `into_parts` cannot drop a pending buffer here.
+        let (file, _) = self.file.into_parts();
+        (file, self.path)
     }
 }
 
