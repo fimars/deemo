@@ -637,12 +637,7 @@ def scenarios() -> list[Scn]:
     def pipe_rep(ctx: Ctx, args) -> float:
         ctx.clear_logs()
         t0 = time.perf_counter()
-        cat = ctx.spawn(["cat", str(BIG)], stdout=PIPE, stderr=DEVNULL)
-        deemo = ctx.spawn(
-            ctx.argv(*args), stdin=cat.stdout, stdout=PIPE, stderr=PIPE,
-            env=ctx.env(),
-        )
-        cat.stdout.close()
+        cat, deemo = cat_pipe(ctx, args)
         deemo.communicate()
         cat.wait()
         dt = time.perf_counter() - t0
@@ -666,12 +661,7 @@ def scenarios() -> list[Scn]:
     def pipe_bg(ctx: Ctx) -> float:
         ctx.clear_logs()
         t0 = time.perf_counter()
-        cat = ctx.spawn(["cat", str(BIG)], stdout=PIPE, stderr=DEVNULL)
-        deemo = ctx.spawn(
-            ctx.argv("-B", "--label", f"pbg{time.time_ns()}"),
-            stdin=cat.stdout, stdout=PIPE, stderr=PIPE, env=ctx.env(),
-        )
-        cat.stdout.close()
+        cat, deemo = cat_pipe(ctx, ["-B", "--label", f"pbg{time.time_ns()}"])
         _, err = deemo.communicate()
         cat.wait()
         if deemo.returncode != 0:
@@ -688,13 +678,8 @@ def scenarios() -> list[Scn]:
     def pipe_head(ctx: Ctx) -> float:
         ctx.clear_logs()
         t0 = time.perf_counter()
-        cat = ctx.spawn(["cat", str(BIG)], stdout=PIPE, stderr=DEVNULL)
         head = ctx.spawn(["head", "-1"], stdin=PIPE, stdout=PIPE, stderr=DEVNULL)
-        deemo = ctx.spawn(
-            ctx.argv("--label", "ph"), stdin=cat.stdout, stdout=head.stdin,
-            stderr=PIPE, env=ctx.env(),
-        )
-        cat.stdout.close()
+        cat, deemo = cat_pipe(ctx, ["--label", "ph"], stdout=head.stdin)
         head.stdin.close()
         _, derr = deemo.communicate()
         head.communicate()
@@ -745,6 +730,15 @@ def scenarios() -> list[Scn]:
     return out
 
 
+def cat_pipe(ctx: Ctx, args, *, stdout=PIPE, source=BIG):
+    """`cat SOURCE | deemo args` over a real pipe, parent copies closed."""
+    cat = ctx.spawn(["cat", str(source)], stdout=PIPE, stderr=DEVNULL)
+    deemo = ctx.spawn(ctx.argv(*args), stdin=cat.stdout, stdout=stdout,
+                      stderr=PIPE, env=ctx.env())
+    cat.stdout.close()
+    return cat, deemo
+
+
 def timed_batch_bin(argv, n, *, expect=(0,), stdout=PIPE) -> float:
     t0 = time.perf_counter()
     for _ in range(n):
@@ -773,25 +767,25 @@ def verify(bin_path: Path) -> list[dict]:
     try:
         big = BIG.read_bytes()
 
-        def pipe_byte_exact():
+        def pipe_run(label, args=(), source=BIG):
+            """One pipe-mode run: (stdout, log bytes or None)."""
             ctx.clear_logs()
-            with open(BIG, "rb") as stdin:
-                _, p = timed_deemo(ctx, ["--label", "chk", "--timestamp", "off"],
-                                   stdin=stdin)
-            assert p.stdout == big, "passthrough is not byte-exact"
-            log = ctx.logs_dir() / "chk.log"
-            assert log.read_bytes() == big, "log is not byte-exact"
+            with open(source, "rb") as stdin:
+                _, p = timed_deemo(ctx, ["--label", label, *args], stdin=stdin)
+            log = ctx.logs_dir() / f"{label}.log"
+            return p.stdout, (log.read_bytes() if log.exists() else None)
+
+        def pipe_byte_exact():
+            out, log = pipe_run("chk", ["--timestamp", "off"])
+            assert out == big, "passthrough is not byte-exact"
+            assert log == big, "log is not byte-exact"
             return f"{len(big)} bytes through and logged"
 
         def pipe_unterminated_tail():
-            ctx.clear_logs()
-            with open(TAIL, "rb") as stdin:
-                _, p = timed_deemo(ctx, ["--label", "tail", "--timestamp", "off"],
-                                   stdin=stdin)
+            out, log = pipe_run("tail", ["--timestamp", "off"], source=TAIL)
             want = TAIL.read_bytes()
-            assert p.stdout == want, "passthrough dropped or altered the tail"
-            assert (ctx.logs_dir() / "tail.log").read_bytes() == want, \
-                "log dropped or altered the tail"
+            assert out == want, "passthrough dropped or altered the tail"
+            assert log == want, "log dropped or altered the tail"
             return "final line without newline kept verbatim"
 
         def fg_byte_exact():
@@ -813,12 +807,9 @@ def verify(bin_path: Path) -> list[dict]:
 
         def head_exits_zero():
             ctx.clear_logs()
-            cat = ctx.spawn(["cat", str(BIG)], stdout=PIPE, stderr=DEVNULL)
             head = ctx.spawn(["head", "-1"], stdin=PIPE, stdout=PIPE,
                              stderr=DEVNULL)
-            deemo = ctx.spawn(ctx.argv("--label", "hd"), stdin=cat.stdout,
-                              stdout=head.stdin, stderr=PIPE, env=ctx.env())
-            cat.stdout.close()
+            cat, deemo = cat_pipe(ctx, ["--label", "hd"], stdout=head.stdin)
             head.stdin.close()
             _, derr = deemo.communicate()
             out, _ = head.communicate()
@@ -871,19 +862,14 @@ def verify(bin_path: Path) -> list[dict]:
             return visible_while_still_running("rtp", producer)
 
         def yolo_passthrough():
-            ctx.clear_logs()
-            with open(BIG, "rb") as stdin:
-                _, p = timed_deemo(ctx, ["--yolo"], stdin=stdin)
-            assert p.stdout == big, "--yolo passthrough is not byte-exact"
-            assert list(ctx.logs_dir().iterdir()) == [], "--yolo wrote a log"
+            out, log = pipe_run("yolo", ["--yolo"])
+            assert out == big, "--yolo passthrough is not byte-exact"
+            assert log is None, "--yolo wrote a log"
             return "no log, no registration, byte-exact"
 
         def bg_settles():
             ctx.clear_logs()
-            cat = ctx.spawn(["cat", str(BIG)], stdout=PIPE, stderr=DEVNULL)
-            deemo = ctx.spawn(ctx.argv("-B", "--label", "bgchk"), stdin=cat.stdout,
-                              stdout=PIPE, stderr=PIPE, env=ctx.env())
-            cat.stdout.close()
+            cat, deemo = cat_pipe(ctx, ["-B", "--label", "bgchk"])
             _, err = deemo.communicate()
             cat.wait()
             log = log_path_from_stderr(ctx, err)

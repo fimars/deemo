@@ -8,6 +8,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Every command is faster, measured by `scripts/bench.py` against a release
+  build (200k lines / 13.5 MB, Apple M4). Piping through deemo: 427 → 19 ms
+  (`--quiet` 305 → 20, `--yolo` 100 → 18); `--foreground`: 435 → 28 ms. The
+  pump moves 64 KiB slabs instead of paying three syscalls per line, and
+  flushes before the read that could block, so a paused writer still sees its
+  line immediately. Foreground still merges whole lines.
+- `kill <PORT>` answers from the process table instead of an `lsof` exec on
+  macOS, and one scan covers every port in the argument list: a 10-port
+  `--dry-run` is 264 → 7 ms. `lsof` stays as the fallback if the table cannot
+  be read.
+- `stop` and `kill` see a cooperative exit in ~1.5 ms instead of ~55 ms: the
+  escalation poll starts at 0.5 ms and doubles to the old 50 ms. The 5 s and
+  1 s windows are unchanged.
+- `ps` and `stop` read the registry once instead of twice, `ps` reads the
+  clock once per table and writes the table in one write: 4000 registrations
+  78 → 33 ms (16 → 8 µs per entry), `stop` with an absent label over 400
+  registrations 15 → 10 ms.
 - `ps` is readable again. The table now sizes its columns to the
   content (a label longer than the old hard-coded 16 chars collapsed
   every column after it), shows the age relative to now (`3d`, `5h`)
@@ -40,6 +57,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   released port read as free (exit 1), and a client connected to the port
   never listed — with the free-check's ports drawn from a pool no other test
   scans.
+
+### Fixed
+
+- `kill <PORT>` no longer reports "survived SIGTERM and SIGKILL" for a
+  process that is already dead. On macOS libproc answers `ESRCH` for a
+  zombie, so the probe read a corpse as alive and the command burned the
+  full 5 s + 1 s grace before exiting 1 (with the process long gone).
+- `kill` reads a port only from TCP and UDP sockets. The value at the same
+  offset in a unix-domain or kernel-control socket is unrelated data — a
+  zero there made `kill 0` match every kernel-control socket.
 
 ## [0.2.0] - 2026-09-22
 

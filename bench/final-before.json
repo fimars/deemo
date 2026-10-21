@@ -1,0 +1,407 @@
+{
+  "label": "final-before",
+  "commit": "27785be",
+  "host": "Apple M4; 27.0.1",
+  "date": "2026-10-21T15:46:31+0800",
+  "binary": "/private/tmp/wt-base/target/release/deemo",
+  "checks": [
+    {
+      "name": "pipe.byte_exact",
+      "ok": true,
+      "detail": "14200000 bytes through and logged"
+    },
+    {
+      "name": "pipe.unterminated_tail",
+      "ok": true,
+      "detail": "final line without newline kept verbatim"
+    },
+    {
+      "name": "pipe.yolo",
+      "ok": true,
+      "detail": "no log, no registration, byte-exact"
+    },
+    {
+      "name": "fg.byte_exact",
+      "ok": true,
+      "detail": "stdout and stderr merged, 15 MB through and logged"
+    },
+    {
+      "name": "fg.quiet",
+      "ok": true,
+      "detail": "log only, no echo"
+    },
+    {
+      "name": "pipe.head_exit0",
+      "ok": true,
+      "detail": "downstream EPIPE: exit 0, one line, silent"
+    },
+    {
+      "name": "fg.realtime",
+      "ok": true,
+      "detail": "line visible after one read, before the next"
+    },
+    {
+      "name": "pipe.realtime",
+      "ok": true,
+      "detail": "line visible after one read, before the next"
+    },
+    {
+      "name": "pipe.background",
+      "ok": true,
+      "detail": "detached pump wrote the whole stream"
+    },
+    {
+      "name": "kill.dry_run_vs_lsof",
+      "ok": true,
+      "detail": "tcp4 [91913] + client, udp4 [91914], tcp6 [91915], free port empty"
+    },
+    {
+      "name": "kill.dedupe",
+      "ok": true,
+      "detail": "each pid listed once across several ports"
+    },
+    {
+      "name": "liveness.zombie",
+      "ok": false,
+      "detail": "kill took 6073 ms on a zombie target"
+    },
+    {
+      "name": "ps.stop",
+      "ok": true,
+      "detail": "registration listed, stopped, swept"
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "fg.lines",
+      "input": "200000 lines / 13 MB",
+      "agg": 1,
+      "reps": 10,
+      "min": 424.85,
+      "median": 435.08,
+      "p90": 508.33,
+      "max": 708.12,
+      "rate": "   460k lines/s"
+    },
+    {
+      "name": "pipe.bg",
+      "input": "cat big.log | deemo -B, until log settles",
+      "agg": 1,
+      "reps": 5,
+      "min": 419.51,
+      "median": 431.84,
+      "p90": 445.43,
+      "max": 445.43,
+      "rate": "   463k lines/s"
+    },
+    {
+      "name": "pipe.lines",
+      "input": "cat big.log | deemo, 200000 lines",
+      "agg": 1,
+      "reps": 10,
+      "min": 405.98,
+      "median": 427.44,
+      "p90": 505.1,
+      "max": 640.47,
+      "rate": "   468k lines/s"
+    },
+    {
+      "name": "kill.many",
+      "input": "5 held ports, real kill in one invocation",
+      "agg": 1,
+      "reps": 10,
+      "min": 391.06,
+      "median": 401.92,
+      "p90": 424.25,
+      "max": 456.41,
+      "rate": " 80385 \u00b5s/kill"
+    },
+    {
+      "name": "stop.alive",
+      "input": "6 live groups under one label",
+      "agg": 1,
+      "reps": 10,
+      "min": 271.34,
+      "median": 323.57,
+      "p90": 327.84,
+      "max": 328.09,
+      "rate": " 53929 \u00b5s/stop"
+    },
+    {
+      "name": "stop.pid",
+      "input": "6 live pids in one invocation",
+      "agg": 1,
+      "reps": 10,
+      "min": 273.31,
+      "median": 321.99,
+      "p90": 325.07,
+      "max": 326.04,
+      "rate": " 53664 \u00b5s/stop"
+    },
+    {
+      "name": "pipe.quiet",
+      "input": "cat big.log | deemo --quiet, 200000 lines",
+      "agg": 1,
+      "reps": 10,
+      "min": 296.14,
+      "median": 304.89,
+      "p90": 331.28,
+      "max": 397.43,
+      "rate": "   656k lines/s"
+    },
+    {
+      "name": "fg.quiet",
+      "input": "200000 lines / 13 MB",
+      "agg": 1,
+      "reps": 10,
+      "min": 285.59,
+      "median": 287.6,
+      "p90": 336.0,
+      "max": 352.95,
+      "rate": "   695k lines/s"
+    },
+    {
+      "name": "kill.free",
+      "input": "10 free ports, --dry-run",
+      "agg": 1,
+      "reps": 10,
+      "min": 254.52,
+      "median": 264.05,
+      "p90": 290.12,
+      "max": 293.21,
+      "rate": " 26405 \u00b5s/port"
+    },
+    {
+      "name": "pipe.yolo",
+      "input": "cat big.log | deemo --yolo, 200000 lines",
+      "agg": 1,
+      "reps": 10,
+      "min": 97.68,
+      "median": 99.57,
+      "p90": 103.1,
+      "max": 106.38,
+      "rate": "  2009k lines/s"
+    },
+    {
+      "name": "kill.held.real",
+      "input": "1 python http.server holder, real kill",
+      "agg": 1,
+      "reps": 10,
+      "min": 79.91,
+      "median": 84.01,
+      "p90": 93.88,
+      "max": 116.71,
+      "rate": "    12 kill/s"
+    },
+    {
+      "name": "ps.2000",
+      "input": "2000 live + 2000 dead registrations",
+      "agg": 1,
+      "reps": 10,
+      "min": 69.94,
+      "median": 77.79,
+      "p90": 107.98,
+      "max": 170.61,
+      "rate": "    19 \u00b5s/entry"
+    },
+    {
+      "name": "ps.v2000",
+      "input": "2000 live + 2000 dead registrations",
+      "agg": 1,
+      "reps": 10,
+      "min": 66.35,
+      "median": 68.08,
+      "p90": 83.08,
+      "max": 88.46,
+      "rate": "    17 \u00b5s/entry"
+    },
+    {
+      "name": "ps.narrow",
+      "input": "2000 live + 2000 dead registrations, COLUMNS=40",
+      "agg": 1,
+      "reps": 10,
+      "min": 63.4,
+      "median": 64.38,
+      "p90": 64.98,
+      "max": 66.19,
+      "rate": "    16 \u00b5s/entry"
+    },
+    {
+      "name": "ref.lsof",
+      "input": "lsof -nP -F pn -i :PORT, free port, aggregated x12",
+      "agg": 12,
+      "reps": 10,
+      "min": 30.9,
+      "median": 32.98,
+      "p90": 38.76,
+      "max": 45.69,
+      "rate": "    30 inv/s"
+    },
+    {
+      "name": "pipe.head",
+      "input": "cat big.log | deemo | head -1",
+      "agg": 1,
+      "reps": 5,
+      "min": 30.99,
+      "median": 32.62,
+      "p90": 69.94,
+      "max": 69.94,
+      "rate": ""
+    },
+    {
+      "name": "kill.held",
+      "input": "1 python http.server holder, --dry-run, aggregated x12",
+      "agg": 12,
+      "reps": 10,
+      "min": 29.19,
+      "median": 30.08,
+      "p90": 30.77,
+      "max": 31.02,
+      "rate": "    33 inv/s"
+    },
+    {
+      "name": "ps.200",
+      "input": "200 live + 200 dead registrations",
+      "agg": 1,
+      "reps": 10,
+      "min": 13.82,
+      "median": 15.42,
+      "p90": 19.72,
+      "max": 20.15,
+      "rate": "    39 \u00b5s/entry"
+    },
+    {
+      "name": "stop.dead",
+      "input": "400 live registrations, absent label, aggregated x20",
+      "agg": 20,
+      "reps": 10,
+      "min": 14.59,
+      "median": 15.31,
+      "p90": 15.98,
+      "max": 17.46,
+      "rate": ""
+    },
+    {
+      "name": "ref.cat",
+      "input": "cat big.log > /dev/null, aggregated x5",
+      "agg": 5,
+      "reps": 10,
+      "min": 11.09,
+      "median": 13.71,
+      "p90": 14.69,
+      "max": 23.66,
+      "rate": " 1036 MB/s"
+    },
+    {
+      "name": "detach.keep",
+      "input": "3000 log files of the label, --keep 5",
+      "agg": 1,
+      "reps": 10,
+      "min": 7.4,
+      "median": 7.83,
+      "p90": 8.26,
+      "max": 8.35,
+      "rate": ""
+    },
+    {
+      "name": "cli.help",
+      "input": "1 inv, aggregated x75",
+      "agg": 75,
+      "reps": 10,
+      "min": 3.9,
+      "median": 6.3,
+      "p90": 8.64,
+      "max": 9.61,
+      "rate": ""
+    },
+    {
+      "name": "detach.true",
+      "input": "1 inv, aggregated x50",
+      "agg": 50,
+      "reps": 10,
+      "min": 5.14,
+      "median": 5.41,
+      "p90": 5.76,
+      "max": 6.16,
+      "rate": ""
+    },
+    {
+      "name": "floor.true",
+      "input": "1 inv, aggregated x100",
+      "agg": 100,
+      "reps": 10,
+      "min": 4.01,
+      "median": 4.77,
+      "p90": 7.15,
+      "max": 7.66,
+      "rate": "   210 inv/s"
+    },
+    {
+      "name": "logs.hit",
+      "input": "201 log files",
+      "agg": 100,
+      "reps": 10,
+      "min": 3.79,
+      "median": 4.35,
+      "p90": 4.9,
+      "max": 5.18,
+      "rate": "   230 inv/s"
+    },
+    {
+      "name": "ps.empty",
+      "input": "1 inv, aggregated x100",
+      "agg": 100,
+      "reps": 10,
+      "min": 3.65,
+      "median": 4.33,
+      "p90": 4.71,
+      "max": 6.2,
+      "rate": ""
+    },
+    {
+      "name": "floor.bare",
+      "input": "1 inv, aggregated x100, stdin=tty",
+      "agg": 100,
+      "reps": 10,
+      "min": 3.79,
+      "median": 4.06,
+      "p90": 4.9,
+      "max": 5.06,
+      "rate": "   246 inv/s"
+    },
+    {
+      "name": "cli.version",
+      "input": "1 inv, aggregated x75",
+      "agg": 75,
+      "reps": 10,
+      "min": 3.52,
+      "median": 3.98,
+      "p90": 4.73,
+      "max": 7.33,
+      "rate": ""
+    },
+    {
+      "name": "logs.miss",
+      "input": "201 log files",
+      "agg": 100,
+      "reps": 10,
+      "min": 3.66,
+      "median": 3.81,
+      "p90": 4.1,
+      "max": 4.1,
+      "rate": "   263 inv/s"
+    },
+    {
+      "name": "logs.big",
+      "input": "10 MB log, 4 KiB tail",
+      "agg": 25,
+      "reps": 10,
+      "min": 3.51,
+      "median": 3.74,
+      "p90": 4.1,
+      "max": 4.23,
+      "rate": "   268 inv/s"
+    }
+  ],
+  "note": "binary built from 4361e4a (harness commit, src == pre-T1 main) in a worktree"
+}

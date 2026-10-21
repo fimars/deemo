@@ -54,6 +54,8 @@ its own status, like `tee`: a pipe cannot carry the upstream's exit code, and
 a pipeline's `$?` is the last command's by shell convention anyway. EOF
 arrives only when every writer closes. If the upstream daemonizes and keeps the write end, deemo waits, and it says so at startup. The way out is detach mode, or `--background`.
 
+Pass-through is slab-based: the pump reads up to 64 KiB and writes that slab to stdout and the log, flushing before the read that could block. `read` returns as soon as any data is available, so a writer that pauses after one line is still seen line by line — a burst is what gets batched into one write instead of three syscalls per line. Foreground keeps whole lines (the two fds merge on one channel, so neither stream can split a line in the log) and buffers both outputs, flushing whenever the channel runs dry, i.e. right before it would block; a slab is the most the log can lag behind.
+
 `--background` (unix) forks the pump into its own session and returns immediately. The child is registered and shows up in `ps`. If the terminal disappears, passthrough is dropped and logging continues until the writers close.
 
 Downstream `EPIPE` (`… | deemo | head`) exits 0 with no error on stderr, the same convention as ripgrep: the reader stopped asking.
