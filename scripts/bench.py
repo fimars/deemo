@@ -18,6 +18,12 @@ either seconds shaved or throughput gained.
 the optimizations must not break: byte-exact passthrough and log, a
 never-flushed tail, `| head` exit 0, log realtime-ness, and `kill --dry-run`
 agreeing with lsof on the binding side of a port.
+
+Two measurement conventions worth knowing before reading the table: the
+throughput rows send deemo's stdout to /dev/null, because a Python reader is
+slower than the pump and would measure the harness; and `--pair-bin` measures
+a second binary interleaved with the first, repetition by repetition, so load
+drift lands on both columns instead of on whichever ran first.
 """
 
 import argparse
@@ -222,7 +228,12 @@ def start_sleep_group(ctx: Ctx) -> int:
 
 
 def registry_fixture(ctx: Ctx, live: int, dead: int) -> None:
-    """`live` + `dead` registrations, plus the pool of real pids behind them."""
+    """`live` + `dead` registrations, plus the pool of real pids behind them.
+
+    `ps` and `stop` delete the dead ones on sight, so the dead half is kept as
+    a recipe and written back before every repetition: the input size in the
+    table is what each invocation actually sees. Writing the corpses back is
+    fixture work and stays out of the timed region."""
     pool = [start_sleep_group(ctx) for _ in range(min(live, LIVE_POOL))]
     now = time.time()
     stamp = lambda i: time.strftime(
@@ -236,8 +247,20 @@ def registry_fixture(ctx: Ctx, live: int, dead: int) -> None:
             stamp(i),
             f"node server{i}.mjs --port {3000 + i % 500}",
         )
-    for i, pid in enumerate(dead_pids(dead)):
-        write_reg(ctx, f"old{i:05d}", pid, stamp(dead - i), f"./bin/worker{i}")
+    ctx.corpses = [  # type: ignore[attr-defined]
+        (f"old{i:05d}.{pid}.pid",
+         f"pid={pid}\nlabel=old{i:05d}\nstarted={stamp(dead - i)}\n"
+         f"cmd=./bin/worker{i}\nlog={ctx.home}/logs/old{i:05d}.log\n")
+        for i, pid in enumerate(dead_pids(dead))
+    ]
+    bury(ctx)
+
+
+def bury(ctx: Ctx) -> None:
+    """Write the dead registrations the command under test just swept."""
+    run = ctx.run_dir()
+    for name, text in ctx.corpses:  # type: ignore[attr-defined]
+        (run / name).write_text(text)
 
 
 def free_ports(n: int) -> list[int]:
@@ -376,17 +399,36 @@ def scenarios() -> list[Scn]:
 
     out.append(Scn("floor.bare", "1 inv, aggregated x100, stdin=tty", agg=100,
                    rep=bare, rate=per_s()))
+    # The machine reference: the same Python runner, the same aggregation,
+    # one trivial exec. It is what says "~2 ms of any deemo number is the
+    # process start itself".
     out.append(
         Scn(
             "floor.true",
             "1 inv, aggregated x100",
             agg=100,
-            rep=lambda c: timed_batch(c, [], 100, stdin=DEVNULL, stdout=DEVNULL),
+            rep=lambda c: timed_batch_bin(["/usr/bin/true"], 100, stdout=DEVNULL),
             rate=per_s(),
         )
     )
-    # `deemo` with no argv is the floor for deemo; /usr/bin/true is the floor
-    # for the machine. Both are timed through the same Python runner.
+
+    # Pipe mode with nothing to pump: EOF at once, so this is the pipe-mode
+    # floor (announce, open the log, exit 0) — the number to read
+    # `pipe.lines` against.
+    def pipe_empty(ctx: Ctx) -> float:
+        ctx.clear_logs()
+        return timed_batch(ctx, [], 100, expect=(0,), stdin=DEVNULL,
+                           stdout=DEVNULL)
+
+    out.append(
+        Scn(
+            "pipe.empty",
+            "0 bytes on stdin, EOF at once, aggregated x100",
+            agg=100,
+            rep=pipe_empty,
+            rate=per_s(),
+        )
+    )
 
     out.append(
         Scn(
@@ -410,6 +452,7 @@ def scenarios() -> list[Scn]:
     # --- ps ---------------------------------------------------------------
     def ps_rep(verbose=False, columns=None):
         def rep(ctx: Ctx) -> float:
+            bury(ctx)  # untimed: the corpses the previous rep swept
             extra = {"COLUMNS": str(columns)} if columns else {}
             dt, _ = timed_deemo(ctx, ["ps"] + (["-v"] if verbose else []),
                                 env_extra=extra)
@@ -420,21 +463,30 @@ def scenarios() -> list[Scn]:
     def ps_setup(live, dead):
         return lambda c: registry_fixture(c, live, dead)
 
-    entries = lambda n: f"{n} live + {n} dead registrations"
-    entries_rate = lambda n: us_per(n * 2, "entry")
+    # The steady state: nobody crashed lately, so every invocation pays the
+    # per-entry scan and nothing else. This is what a user's `ps` costs.
+    entries = lambda n: f"{n} live registrations"
     for n in (200, 2000):
         out.append(
-            Scn(f"ps.{n}", entries(n), setup=ps_setup(n, n), rep=ps_rep(),
-                rate=entries_rate(n))
+            Scn(f"ps.{n}", entries(n), setup=ps_setup(n, 0), rep=ps_rep(),
+                rate=us_per(n, "entry"))
         )
     out.append(
-        Scn("ps.v2000", entries(2000), setup=ps_setup(2000, 2000),
-            rep=ps_rep(verbose=True), rate=entries_rate(2000))
+        Scn("ps.v2000", entries(2000), setup=ps_setup(2000, 0),
+            rep=ps_rep(verbose=True), rate=us_per(2000, "entry"))
     )
     out.append(
         Scn("ps.narrow", entries(2000) + ", COLUMNS=40",
-            setup=ps_setup(2000, 2000), rep=ps_rep(columns=40),
-            rate=entries_rate(2000))
+            setup=ps_setup(2000, 0), rep=ps_rep(columns=40),
+            rate=us_per(2000, "entry"))
+    )
+    # After crashes: half the registry is corpses, and ps sweeps them. Kept
+    # smaller than ps.2000 because the sweep cost is dominated by unlink and
+    # writing thousands of corpses back between reps makes the row jittery.
+    out.append(
+        Scn("ps.corpses", "200 live + 200 dead registrations",
+            setup=ps_setup(200, 200), rep=ps_rep(),
+            rate=us_per(400, "entry"))
     )
     out.append(
         Scn(
@@ -619,7 +671,8 @@ def scenarios() -> list[Scn]:
     def fg(args):
         def rep(ctx: Ctx) -> float:
             ctx.clear_logs()
-            dt, _ = timed_deemo(ctx, ["-F", *args, "cat", str(BIG)])
+            dt, _ = timed_deemo(ctx, ["-F", *args, "cat", str(BIG)],
+                                stdout=DEVNULL)
             return dt
 
         return rep
@@ -637,7 +690,7 @@ def scenarios() -> list[Scn]:
     def pipe_rep(ctx: Ctx, args) -> float:
         ctx.clear_logs()
         t0 = time.perf_counter()
-        cat, deemo = cat_pipe(ctx, args)
+        cat, deemo = cat_pipe(ctx, args, stdout=DEVNULL)
         deemo.communicate()
         cat.wait()
         dt = time.perf_counter() - t0
@@ -661,7 +714,8 @@ def scenarios() -> list[Scn]:
     def pipe_bg(ctx: Ctx) -> float:
         ctx.clear_logs()
         t0 = time.perf_counter()
-        cat, deemo = cat_pipe(ctx, ["-B", "--label", f"pbg{time.time_ns()}"])
+        cat, deemo = cat_pipe(ctx, ["-B", "--label", f"pbg{time.time_ns()}"],
+                              stdout=DEVNULL)
         _, err = deemo.communicate()
         cat.wait()
         if deemo.returncode != 0:
@@ -1037,18 +1091,8 @@ def verify(bin_path: Path) -> list[dict]:
 # --------------------------------------------------------------------------
 
 
-def run_scenario(scn: Scn, bin_path: Path) -> dict:
-    ctx = Ctx(scn.name, bin_path)
-    try:
-        if scn.setup:
-            scn.setup(ctx)
-        for _ in range(WARMUP):
-            scn.rep(ctx)
-        samples = [scn.rep(ctx) / scn.agg * 1000 for _ in range(scn.reps)]
-    finally:
-        ctx.teardown()
-
-    samples.sort()
+def stats(scn: Scn, samples: list[float]) -> dict:
+    samples = sorted(samples)
     n = len(samples)
     med = samples[n // 2] if n % 2 else (samples[n // 2 - 1] + samples[n // 2]) / 2
     p90 = samples[min(n - 1, int(round(0.9 * (n - 1))))]
@@ -1063,6 +1107,38 @@ def run_scenario(scn: Scn, bin_path: Path) -> dict:
         "max": round(samples[-1], 2),
         "rate": scn.rate(med) if scn.rate else "",
     }
+
+
+def run_scenario(scn: Scn, bins: list[Path]) -> dict[str, dict]:
+    """Measure one scenario for one or more binaries on one fixture.
+
+    With several binaries their repetitions are interleaved (and the order
+    flipped every repetition), so a load spike lands on all columns instead of
+    on whichever binary was measured first — the machine this runs on is a
+    desktop, not a lab bench.
+    """
+    ctx = Ctx(scn.name, bins[0])
+    samples: dict[Path, list[float]] = {b: [] for b in bins}
+    try:
+        if scn.setup:
+            scn.setup(ctx)
+        for _ in range(WARMUP):
+            for b in bins:
+                ctx.bin = b
+                scn.rep(ctx)
+        for i in range(scn.reps):
+            for b in (bins if i % 2 == 0 else list(reversed(bins))):
+                ctx.bin = b
+                samples[b].append(scn.rep(ctx) / scn.agg * 1000)
+    finally:
+        ctx.teardown()
+    return {b: stats(scn, samples[b]) for b in bins}
+
+
+def error_row(scn: Scn, e: Exception) -> dict:
+    return {"name": scn.name, "input": scn.input, "agg": scn.agg,
+            "reps": scn.reps, "min": 0, "median": 0, "p90": 0, "max": 0,
+            "rate": f"ERROR: {e}"}
 
 
 def git_commit() -> str:
@@ -1156,9 +1232,25 @@ def main() -> int:
     ap.add_argument("--diff", default=None, help="compare against bench/<label>.json")
     ap.add_argument("--list", action="store_true", help="list scenario names")
     ap.add_argument("--bin", default=str(DEFAULT_BIN))
+    ap.add_argument("--pair-bin", default=None,
+                    help="second binary, measured interleaved with --bin")
+    ap.add_argument("--pair-label", default=None,
+                    help="artifact name for --pair-bin")
     args = ap.parse_args()
+    if bool(args.pair_bin) != bool(args.pair_label):
+        ap.error("--pair-bin and --pair-label go together")
 
     bin_path = Path(args.bin).resolve()
+    bins = [bin_path]
+    if args.pair_bin:
+        bins.append(Path(args.pair_bin).resolve())
+        for b in bins:
+            if not b.exists():
+                print(f"missing {b}", file=sys.stderr)
+                return 2
+    labels = {bin_path: args.label}
+    if args.pair_bin:
+        labels[bins[1]] = args.pair_label
     build_shared_fixture()
     try:
         if args.list:
@@ -1182,51 +1274,62 @@ def main() -> int:
                 s.reps = args.reps
 
         failed: list[str] = []
-        checks: list[dict] = []
+        checks: dict[Path, list[dict]] = {}
         if not args.no_verify:
             print("verifying behaviour (E2E checks) …", flush=True)
-            checks = verify(bin_path)
-            for c in checks:
-                print(f"  {'ok  ' if c['ok'] else 'FAIL'} {c['name']:<20} {c['detail']}")
-            failed += [c["name"] for c in checks if not c["ok"]]
+            for b in bins:
+                result = verify(b)
+                checks[b] = result
+                print(f"  {b}")
+                for c in result:
+                    print(f"    {'ok  ' if c['ok'] else 'FAIL'} {c['name']:<20} {c['detail']}")
+                failed += [c["name"] for c in result if not c["ok"]]
 
-        rows = []
+        rows: dict[Path, list[dict]] = {b: [] for b in bins}
         for scn in picks:
             print(f".. {scn.name} ({scn.input})", flush=True)
             try:
-                rows.append(run_scenario(scn, bin_path))
+                for b, row in run_scenario(scn, bins).items():
+                    rows[b].append(row)
             except Exception as e:  # noqa: BLE001 - report, keep going, fail at end
                 traceback.print_exc()
                 failed.append(scn.name)
-                rows.append({"name": scn.name, "input": scn.input, "agg": scn.agg,
-                             "reps": scn.reps, "min": 0, "median": 0, "p90": 0,
-                             "max": 0, "rate": f"ERROR: {e}"})
-        rows.sort(key=lambda r: -r["median"])
+                for b in bins:
+                    rows[b].append(error_row(scn, e))
+        for b in bins:
+            rows[b].sort(key=lambda r: -r["median"])
 
-        print()
-        print_table(rows)
-        print_variance(rows)
+        artifacts = {}
+        for b in bins:
+            print()
+            print(f"== {labels[b]} ({b})")
+            print_table(rows[b])
+            print_variance(rows[b])
+            artifacts[b] = {
+                "label": labels[b],
+                "commit": git_commit(),
+                "host": host_info(),
+                "date": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "binary": str(b),
+                "checks": checks.get(b, []),
+                "scenarios": rows[b],
+            }
+            if len(bins) > 1:
+                others = ", ".join(str(o) for o in bins if o != b)
+                artifacts[b]["note"] = f"reps interleaved with {others}"
 
-        artifact = {
-            "label": args.label,
-            "commit": git_commit(),
-            "host": host_info(),
-            "date": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "binary": str(bin_path),
-            "checks": checks,
-            "scenarios": rows,
-        }
         BENCH_DIR.mkdir(exist_ok=True)
-        out = BENCH_DIR / f"{args.label}.json"
-        out.write_text(json.dumps(artifact, indent=2) + "\n")
-        print(f"\nwrote {out.relative_to(REPO)}")
+        for b in bins:
+            out = BENCH_DIR / f"{labels[b]}.json"
+            out.write_text(json.dumps(artifacts[b], indent=2) + "\n")
+            print(f"\nwrote {out.relative_to(REPO)}")
 
         if args.diff:
             other = BENCH_DIR / f"{args.diff}.json"
             if not other.exists():
                 print(f"no artifact {other}", file=sys.stderr)
                 return 2
-            diff(json.loads(other.read_text()), artifact)
+            diff(json.loads(other.read_text()), artifacts[bin_path])
 
         if failed:
             print(f"\nFAILED: {', '.join(failed)}", file=sys.stderr)
