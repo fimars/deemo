@@ -828,24 +828,47 @@ def verify(bin_path: Path) -> list[dict]:
             assert b"error" not in derr.lower(), f"stderr complained: {derr!r}"
             return "downstream EPIPE: exit 0, one line, silent"
 
-        def realtime_log():
+        def visible_while_still_running(label, producer):
+            """The log must show line 1 while the stream is still open and
+            silent: a full second before line 2 can arrive. That is the
+            flush-before-blocking rule, measured causally."""
             ctx.clear_logs()
-            log = ctx.logs_dir() / "rt.log"
-            d = ctx.spawn(
-                ctx.argv("-F", "--label", "rt", "--timestamp", "off",
-                         "sh", "-c", "echo first; sleep 2; echo second"),
-                stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL, env=ctx.env(),
-            )
-            end = time.time() + 1.0  # well inside the child's 2 s pause
+            log = ctx.logs_dir() / f"{label}.log"
+            proc = producer()
+            end = time.time() + 1.0  # well inside the 2 s pause
             while time.time() < end:
                 if log.exists() and b"first" in log.read_bytes():
-                    assert d.poll() is None, "child already exited; not causal"
-                    d.wait()
+                    assert proc.poll() is None, "stream already closed; not causal"
+                    proc.wait()
                     return "line visible after one read, before the next"
                 time.sleep(0.01)
-            d.kill()
-            d.wait()
-            raise BenchError("log lagged more than 1 s behind a 2 s pause")
+            proc.kill()
+            proc.wait()
+            raise BenchError(f"{label}: log lagged >1 s behind a 2 s pause")
+
+        def fg_realtime():
+            return visible_while_still_running(
+                "rtf",
+                lambda: ctx.spawn(
+                    ctx.argv("-F", "--label", "rtf", "--timestamp", "off",
+                             "sh", "-c", "echo first; sleep 2; echo second"),
+                    stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL, env=ctx.env(),
+                ),
+            )
+
+        def pipe_realtime():
+            def producer():
+                d = ctx.spawn(
+                    ctx.argv("--label", "rtp", "--timestamp", "off"),
+                    stdin=PIPE, stdout=DEVNULL, stderr=PIPE, env=ctx.env(),
+                )
+                d.stdin.write(b"first\n")
+                d.stdin.flush()
+                # the write end stays open: EOF is what ends the pump
+                threading.Timer(2.0, lambda: d.stdin.close()).start()
+                return d
+
+            return visible_while_still_running("rtp", producer)
 
         def yolo_passthrough():
             ctx.clear_logs()
@@ -1011,7 +1034,8 @@ def verify(bin_path: Path) -> list[dict]:
         check("fg.byte_exact", fg_byte_exact)
         check("fg.quiet", fg_quiet)
         check("pipe.head_exit0", head_exits_zero)
-        check("log.realtime", realtime_log)
+        check("fg.realtime", fg_realtime)
+        check("pipe.realtime", pipe_realtime)
         check("pipe.background", bg_settles)
         check("kill.dry_run_vs_lsof", kill_dry_run_matches_lsof)
         check("kill.dedupe", kill_dedupe)

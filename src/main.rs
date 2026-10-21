@@ -335,6 +335,9 @@ fn pump_pipe(cli: &Cli, sink: &mut Option<sink::Sink>, detached: bool) -> i32 {
             }
         }
     }
+    // `pipe_background`'s child ends in `process::exit`, which runs no
+    // destructor: whatever is still buffered has to be pushed out here.
+    flush_log(sink);
     let _ = stdout.flush();
     report_log(sink);
     if INTERRUPTED.load(Ordering::SeqCst) {
@@ -464,13 +467,13 @@ impl Out {
     }
 
     fn write(&mut self, line: &[u8]) -> Result<(), Stop> {
-        if !self.quiet {
-            if let Err(e) = self.stdout.write_all(line) {
-                return Err(stdout_stopped(e));
-            }
-        }
+        // Log first, like `emit` in pipe mode: a closed downstream must not
+        // cost the log the line that was read.
         write_log(&mut self.sink, line);
-        Ok(())
+        if self.quiet {
+            return Ok(());
+        }
+        self.stdout.write_all(line).map_err(stdout_stopped)
     }
 
     fn flush(&mut self) -> Result<(), Stop> {
