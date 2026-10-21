@@ -101,6 +101,8 @@ cargo test            # black-box suite: tests/job_<feature>.rs per user job,
                       # tests/contract_*.rs for cross-cutting contracts
                       # (exit codes, signals, log/home rules), tests/support/
                       # the shared harness; unit tests stay next to the code
+scripts/bench.py      # every command in ms, against a throwaway $DEEMO_HOME
+                      # (writes bench/<label>.json; --diff before compares)
 scripts/e2e-tmux.sh    # tmux smoke: only what a real tty can prove
 ```
 
